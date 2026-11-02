@@ -1,0 +1,26 @@
+# 依赖与构建产物
+node_modules/
+*.tsbuildinfo
+
+# 运行期状态与日志（守护进程会持续写，别进仓库）
+state/
+*.log
+*.pid
+
+# 备份文件
+*.bak
+*.bak-*
+*.auto-repair.bak-*
+
+# 令牌与凭据——**绝对不要提交**
+*token*
+*secret*
+*.env
+*.env.*
+credentials.json
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
