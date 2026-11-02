@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="14" fill="#16181d"/>
+  <!-- 盾牌轮廓：代表守护 -->
+  <path d="M32 10 L50 18 V33 C50 43 42 51 32 54 C22 51 14 43 14 33 V18 Z"
+        fill="none" stroke="#5b8cff" stroke-width="3" stroke-linejoin="round"/>
+  <!-- 中心的心跳线：代表自动修复 -->
+  <path d="M20 33 H26 L29 25 L34 41 L37 33 H44"
+        fill="none" stroke="#39d98a" stroke-width="3.2"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

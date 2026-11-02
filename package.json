@@ -1,0 +1,58 @@
+{
+  "name": "dsh-auto-repair-ui",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 插件：自愈守护进程的可视化面板——实时诊断结论、修复历史，一键手动修复。 | DSH plugin: visual dashboard for a self-healing daemon — live diagnostics, repair history, one-click manual repair.",
+  "author": "蝠羽科技",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "self-heal",
+    "auto-repair",
+    "monitor",
+    "batwing-tech"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "locale/*.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5"
+  },
+  "engines": {
+    "node": "^22.15.0 || >=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fuyu-technology/dsh-auto-repair-ui.git"
+  },
+  "homepage": "https://github.com/fuyu-technology/dsh-auto-repair-ui#readme",
+  "bugs": {
+    "url": "https://github.com/fuyu-technology/dsh-auto-repair-ui/issues"
+  }
+}
