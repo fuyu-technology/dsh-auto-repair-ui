@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "DeepSeek Harness 插件：自愈守护进程的可视化面板——实时诊断结论、修复历史，一键手动修复。 | DSH plugin: visual dashboard for a self-healing daemon — live diagnostics, repair history, one-click manual repair.",
   "author": "蝠羽科技",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "keywords": [
     "dsh",
@@ -22,6 +22,8 @@
     "./icon": "./icon.svg"
   },
   "files": [
+    "LICENSE",
+    "NOTICE",
     "index.js",
     "client.js",
     "cordis.patch.yml",
