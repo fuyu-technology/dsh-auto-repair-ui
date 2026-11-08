@@ -17,25 +17,6 @@
 // 详见 LICENSE 与 NOTICE。
 //
 
-// dsh-auto-repair-ui
-// Copyright 2026 蝠羽科技 (fuyu-technology)  —  https://github.com/fuyu-technology
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// 允许二次修改与再分发，但必须保留上述署名与版权声明，不得删除或改写。
-// 详见 LICENSE 与 NOTICE。
-//
-
 // dsh-auto-repair-ui · 宿主侧
 //
 // 职责：把 auto-repair 守护进程的数据暴露成 HTTP API，供客户端面板读取和操作。
@@ -59,6 +40,11 @@ const STATUS_PATH = `${API_BASE}/status`
 const DIAGNOSE_PATH = `${API_BASE}/diagnose`
 const REPAIR_PATH = `${API_BASE}/repair`
 const HISTORY_PATH = `${API_BASE}/history`
+const POLICY_PATH = `${API_BASE}/policy`
+const REPAIR_ONE_PATH = `${API_BASE}/repair-one`
+const REPAIR_ALL_PATH = `${API_BASE}/repair-all`
+const AGENT_PATH = `${API_BASE}/agent-assist`
+const IGNORE_PATH = `${API_BASE}/ignore`
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // auto-repair 守护进程的实际位置。
@@ -89,6 +75,81 @@ function readJson(file, fallback) {
   } catch {
     return fallback
   }
+}
+
+/** 读 POST 请求体（JSON） */
+function readBody(req) {
+  return new Promise((resolve) => {
+    let buf = ''
+    req.on('data', (c) => { buf += c; if (buf.length > 2e6) req.destroy() })
+    req.on('end', () => { try { resolve(JSON.parse(buf || '{}')) } catch { resolve({}) } })
+    req.on('error', () => resolve({}))
+  })
+}
+
+/**
+ * 调 auto-repair 的 CLI。
+ *
+ * ⚠️ 为什么不直接在插件里 import 守护进程的模块？
+ *   插件装在 ~/.dsh/plugins/ 下，守护进程在 D:\大肥鱼\auto-repair\ ——
+ *   两棵完全不同的目录树，import 不到。只能以子进程方式调 CLI。
+ *   好处也在这里：**策略与修复逻辑只有一份实现**（在守护进程那边），
+ *   插件只负责传参和显示结果，不会出现两边逻辑对不上的情况。
+ */
+function runCli(args, timeoutMs = 90000) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(REPAIR_ENTRY)) {
+      resolve({ ok: false, error: '找不到 auto-repair 脚本', stdout: '', stderr: '' })
+      return
+    }
+    try {
+      execFile(
+        findNode(),
+        [REPAIR_ENTRY, ...args],
+        { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8' },
+        (err, stdout, stderr) => {
+          const out = String(stdout || '')
+          const errOut = String(stderr || '')
+          let json = null
+          try { json = JSON.parse(out.trim() || 'null') } catch {}
+          resolve({
+            ok: !err,
+            json,
+            stdout: out,
+            stderr: errOut,
+            error: err ? err.message : ''
+          })
+        }
+      )
+    } catch (e) {
+      resolve({ ok: false, error: e.message, stdout: '', stderr: '' })
+    }
+  })
+}
+
+/**
+ * 读当前审批策略。
+ *
+ * 直接读 state/repair-policy.json —— 这里**只是显示**，不参与任何判定，
+ * 所以不调用 CLI 也行（省一次子进程启动）。真正的写操作一律走
+ * `--set-policy`，保证合并语义只有 policy.mjs 一份实现。
+ */
+function readPolicyFile() {
+  const doc = readJson(path.join(REPAIR_STATE, 'repair-policy.json'), null)
+  const src = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : {}
+  return {
+    mode: ['manual', 'approve-all', 'reject-all'].includes(String(src.mode)) ? String(src.mode) : 'manual',
+    agentAssist: src.agentAssist !== false,
+    rejectedCodes: Array.isArray(src.rejectedCodes) ? src.rejectedCodes.map(String) : [],
+    updatedAt: Number(src.updatedAt) || 0
+  }
+}
+
+/** 写策略（走 CLI，合并语义由 policy.mjs 负责） */
+async function writePolicy(patch) {
+  const r = await runCli(['--set-policy', JSON.stringify(patch)], 20000)
+  if (r.json?.policy) return { ok: true, policy: r.json.policy }
+  return { ok: false, error: r.json?.error || r.error || r.stderr || '改策略失败' }
 }
 
 /** 守护进程是否在跑（读它自己的 pid 锁） */
@@ -216,6 +277,7 @@ async function collectStatus() {
   const fatal = findings.filter((f) => f.severity === 'fatal')
   const warn = findings.filter((f) => f.severity === 'warn')
   const info = findings.filter((f) => f.severity === 'info')
+  const policy = readPolicyFile()
 
   return {
     ok: true,
@@ -228,6 +290,9 @@ async function collectStatus() {
     },
     health: fatal.length ? 'fatal' : warn.length ? 'warn' : 'ok',
     counts: { fatal: fatal.length, warn: warn.length, info: info.length, total: findings.length },
+    // 审批策略：逐条审批 / 全部自动 / 全拒绝
+    policy,
+    // findings 里每条都带了 fixable / needsHuman / rejected / handoff（由守护进程 enrich）
     findings,
     counters: counters(),
     history: recentHistory(30),
@@ -294,6 +359,112 @@ function apply(ctx) {
     }
   }))
 
+  // ── 审批策略 ──────────────────────────────────────────────────────────────
+  // 同一个 path 只注册一次（webServer 按 path 建表，重复注册会互相覆盖）。
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: POLICY_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        sendJson(res, 200, { ok: true, policy: readPolicyFile() })
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        const patch = {}
+        if (body.mode !== undefined) patch.mode = String(body.mode)
+        if (body.agentAssist !== undefined) patch.agentAssist = body.agentAssist === true
+        if (!Object.keys(patch).length) {
+          sendJson(res, 400, { ok: false, error: '没有要改的字段' })
+          return
+        }
+        const r = await writePolicy(patch)
+        sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, policy: r.policy } : { ok: false, error: r.error })
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
+  // ── 手动修某一条（= 用户点了那一条的「修复」） ────────────────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: REPAIR_ONE_PATH,
+    handler: async (req, res) => {
+      if (String(req.method || '').toUpperCase() !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      const body = await readBody(req)
+      const code = String(body.code || '').trim()
+      if (!code) {
+        sendJson(res, 400, { ok: false, error: '缺少 code' })
+        return
+      }
+      const r = await runCli(['--repair', code], 120000)
+      const json = r.json || { ok: false, error: r.error || r.stderr || '修复失败' }
+      sendJson(res, json.ok ? 200 : 200, { ...json, output: r.stdout })
+    }
+  }))
+
+  // ── 一次性把能修的全修了 ─────────────────────────────────────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: REPAIR_ALL_PATH,
+    handler: async (req, res) => {
+      if (String(req.method || '').toUpperCase() !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      const r = await runCli(['--repair-all'], 180000)
+      const json = r.json || { ok: false, error: r.error || r.stderr || '批量修复失败' }
+      sendJson(res, 200, { ...json, output: r.stdout })
+    }
+  }))
+
+  // ── 把某一条交给 AI 会话去修 ─────────────────────────────────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: AGENT_PATH,
+    handler: async (req, res) => {
+      if (String(req.method || '').toUpperCase() !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      const body = await readBody(req)
+      const code = String(body.code || '').trim()
+      if (!code) {
+        sendJson(res, 400, { ok: false, error: '缺少 code' })
+        return
+      }
+      const r = await runCli(['--agent', code], 60000)
+      const json = r.json || { ok: false, error: r.error || r.stderr || '拉起 AI 失败' }
+      sendJson(res, 200, json)
+    }
+  }))
+
+  // ── 忽略 / 取消忽略某一条 ─────────────────────────────────────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: IGNORE_PATH,
+    handler: async (req, res) => {
+      if (String(req.method || '').toUpperCase() !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      const body = await readBody(req)
+      const code = String(body.code || '').trim()
+      if (!code) {
+        sendJson(res, 400, { ok: false, error: '缺少 code' })
+        return
+      }
+      const ignored = body.ignored !== false
+      const r = await writePolicy(ignored ? { addRejected: [code] } : { removeRejected: [code] })
+      sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, code, ignored, policy: r.policy } : { ok: false, error: r.error })
+    }
+  }))
+
   const dispose = () => {
     for (const d of disposers) {
       try { d?.dispose?.() } catch {}
@@ -301,7 +472,7 @@ function apply(ctx) {
   }
   if (typeof ctx?.effect === 'function') ctx.effect(() => dispose, `${NS}: api routes`)
   try {
-    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}`)
+    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
   } catch {}
   return dispose
 }

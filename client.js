@@ -17,25 +17,6 @@
 // 详见 LICENSE 与 NOTICE。
 //
 
-// dsh-auto-repair-ui
-// Copyright 2026 蝠羽科技 (fuyu-technology)  —  https://github.com/fuyu-technology
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// 允许二次修改与再分发，但必须保留上述署名与版权声明，不得删除或改写。
-// 详见 LICENSE 与 NOTICE。
-//
-
 // dsh-auto-repair-ui · 客户端
 //
 // 在 DSH 设置页里加一个「自愈」页面，展示 auto-repair 守护进程的状态。
@@ -194,6 +175,49 @@ window.__ModuleLoader__.load({
 }
 .ar-toast.ok { border-left: 3px solid var(--ar-ok); }
 .ar-toast.err { border-left: 3px solid var(--ar-fatal); }
+
+/* ── 审批策略 ─────────────────────────────────────────────────────────── */
+.ar-policy {
+  border: 1px solid var(--dsw-alias-border-l2, #ffffff1f);
+  border-radius: 10px; padding: 12px 14px; margin-bottom: 14px;
+  background: var(--dsw-alias-bg-layer-1, #ffffff08);
+}
+.ar-policy-head { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; flex-wrap: wrap; }
+.ar-policy-title { font-weight: 600; font-size: 13px; }
+.ar-policy-hint { color: var(--dsw-alias-label-secondary, #8a8a8a); font-size: 12px; flex: 1 1 240px; min-width: 0; }
+.ar-seg { display: inline-flex; border: 1px solid var(--dsw-alias-border-l2, #ffffff1f); border-radius: 8px; overflow: hidden; }
+.ar-seg-btn {
+  border: none; background: transparent; color: var(--dsw-alias-label-secondary, #8a8a8a);
+  padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: inherit; white-space: nowrap;
+}
+.ar-seg-btn + .ar-seg-btn { border-left: 1px solid var(--dsw-alias-border-l2, #ffffff1f); }
+.ar-seg-btn.on {
+  background: var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, #5b8cff));
+  color: var(--dsw-alias-label-primary-foreground, #fff);
+}
+.ar-seg-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ar-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; color: var(--dsw-alias-label-primary, inherit); }
+.ar-check input { margin: 0; cursor: pointer; }
+.ar-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ── 每条错误的操作按钮 ───────────────────────────────────────────────── */
+.ar-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+.ar-actions .ar-btn { padding: 3px 10px; font-size: 11px; }
+.ar-flag {
+  font-size: 10px; padding: 1px 6px; border-radius: 4px; margin-left: 7px;
+  border: 1px solid var(--dsw-alias-border-l2, #ffffff1f);
+  color: var(--dsw-alias-label-secondary, #8a8a8a);
+}
+.ar-flag.rejected { color: var(--ar-warn); border-color: var(--ar-warn); }
+.ar-flag.agent { color: var(--ar-ok); border-color: var(--ar-ok); }
+.ar-reply {
+  margin-top: 6px; padding: 7px 9px; border-radius: 6px; font-size: 11px;
+  border: 1px solid var(--dsw-alias-border-l1, #ffffff12);
+  background: var(--dsw-alias-bg-layer-2, #ffffff0d);
+  white-space: pre-wrap; word-break: break-word;
+  color: var(--dsw-alias-label-secondary, #8a8a8a);
+  max-height: 160px; overflow-y: auto;
+}
 `
 
     function fmtTime(ts) {
@@ -230,6 +254,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [toast, setToast] = useState(null)
       const [err, setErr] = useState('')
+      const [busyCode, setBusyCode] = useState('')
+      const [policyBusy, setPolicyBusy] = useState(false)
       const timerRef = useRef(null)
 
       const load = useCallback(async (silent) => {
@@ -266,6 +292,109 @@ window.__ModuleLoader__.load({
         }
       }, [load])
 
+      // ── 审批相关的动作 ──────────────────────────────────────────────────
+
+      const postJson = useCallback(async (pathname, body) => {
+        return await fetchJson(pathname, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body || {})
+        })
+      }, [])
+
+      /** 改审批策略（逐条审批 / 全部自动 / 全拒绝，以及「交给 AI」开关） */
+      const setPolicy = useCallback(async (patch) => {
+        setPolicyBusy(true)
+        setToast(null)
+        try {
+          const r = await postJson('/policy', patch)
+          if (r && r.ok) {
+            setToast({ ok: true, text: '策略已更新，下一轮巡检（30 秒内）就按新策略走' })
+          } else {
+            setToast({ ok: false, text: r?.error || '改策略失败' })
+          }
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setPolicyBusy(false)
+        }
+      }, [postJson, load])
+
+      /** 修某一条（= 审批通过这一条） */
+      const repairOne = useCallback(async (code) => {
+        setBusyCode(code)
+        setToast(null)
+        try {
+          const r = await postJson('/repair-one', { code })
+          const lines = Array.isArray(r?.results) && r.results.length
+            ? r.results.map((x) => `${x.code}：${x.ok ? '✅' : '⚠️'} ${x.action || ''}`).join('\n')
+            : String(r?.error || '（无输出）')
+          setToast({ ok: r?.ok !== false, text: lines })
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setBusyCode('')
+        }
+      }, [postJson, load])
+
+      /** 把能修的一次全修了 */
+      const repairAll = useCallback(async () => {
+        setBusy(true)
+        setToast(null)
+        try {
+          const r = await postJson('/repair-all', {})
+          const lines = Array.isArray(r?.results) && r.results.length
+            ? r.results.map((x) => `${x.code}：${x.ok ? '✅' : '⚠️'} ${x.action || ''}`).join('\n')
+            : String(r?.error || '（无输出）')
+          setToast({ ok: r?.ok !== false, text: lines })
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setBusy(false)
+        }
+      }, [postJson, load])
+
+      /** 把某一条交给 AI 会话去修 */
+      const askAgent = useCallback(async (code) => {
+        setBusyCode(code)
+        setToast(null)
+        try {
+          const r = await postJson('/agent-assist', { code })
+          setToast({
+            ok: r?.ok !== false,
+            text: r?.ok
+              ? `已拉起 AI 协助处理 ${code}（它在后台跑，完成后这里会显示它的总结）`
+              : String(r?.error || '拉起 AI 失败')
+          })
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setBusyCode('')
+        }
+      }, [postJson, load])
+
+      /** 忽略 / 取消忽略某一条 */
+      const toggleIgnore = useCallback(async (code, ignored) => {
+        setBusyCode(code)
+        setToast(null)
+        try {
+          const r = await postJson('/ignore', { code, ignored })
+          setToast({
+            ok: r?.ok !== false,
+            text: r?.ok ? (ignored ? `已忽略 ${code}，以后不再自动处理` : `已取消忽略 ${code}`) : String(r?.error || '操作失败')
+          })
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setBusyCode('')
+        }
+      }, [postJson, load])
+
       if (loading) {
         return h('div', { className: 'ar-root' },
           h('div', { className: 'ar-empty' }, '正在读取自愈状态…')
@@ -285,8 +414,15 @@ window.__ModuleLoader__.load({
       const health = d.health || 'ok'
       const counts = d.counts || { fatal: 0, warn: 0, info: 0, total: 0 }
       const daemon = d.daemon || {}
+      const policy = d.policy || { mode: 'manual', agentAssist: true, rejectedCodes: [] }
+      const rejectAll = policy.mode === 'reject-all'
       const healthText = health === 'fatal' ? '发现严重故障' : health === 'warn' ? '有可修复项' : '一切正常'
       const healthClass = health === 'fatal' ? 'fatal' : health === 'warn' ? 'warn' : 'ok'
+      const policyHint = rejectAll
+        ? '全拒绝：守护进程不会自动修任何东西，面板上的「修复」也点不动。改回别的模式即可恢复。'
+        : policy.mode === 'approve-all'
+          ? '全部自动：守护进程发现能修的直接修，不用等你点。'
+          : '逐条审批：守护进程只报告不改，等你点某一条的「修复」才动手。'
 
       return h('div', { className: 'ar-root' },
         h('style', null, STYLE),
@@ -311,7 +447,7 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'ar-btn primary', disabled: busy,
               onClick: doRepair
-            }, busy ? '修复中…' : '立即诊断并修复')
+            }, busy ? '巡检中…' : '巡检一轮')
           )
         ),
 
@@ -339,18 +475,84 @@ window.__ModuleLoader__.load({
 
         toast ? h('div', { className: `ar-toast ${toast.ok ? 'ok' : 'err'}` }, toast.text) : null,
 
+        // ── 审批策略 ────────────────────────────────────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, '审批策略'),
+            h('span', { className: 'ar-policy-hint' }, policyHint)
+          ),
+          h('div', { className: 'ar-row' },
+            h('div', { className: 'ar-seg' },
+              h('button', {
+                className: `ar-seg-btn ${policy.mode === 'manual' ? 'on' : ''}`,
+                disabled: policyBusy,
+                onClick: () => setPolicy({ mode: 'manual' })
+              }, '逐条审批'),
+              h('button', {
+                className: `ar-seg-btn ${policy.mode === 'approve-all' ? 'on' : ''}`,
+                disabled: policyBusy,
+                onClick: () => setPolicy({ mode: 'approve-all' })
+              }, '全部自动'),
+              h('button', {
+                className: `ar-seg-btn ${rejectAll ? 'on' : ''}`,
+                disabled: policyBusy,
+                onClick: () => setPolicy({ mode: 'reject-all' })
+              }, '全拒绝')
+            ),
+            h('label', { className: 'ar-check' },
+              h('input', {
+                type: 'checkbox',
+                checked: policy.agentAssist !== false,
+                disabled: policyBusy || rejectAll,
+                onChange: (e) => setPolicy({ agentAssist: !!e.target.checked })
+              }),
+              '修不了的时候让 AI 接手'
+            ),
+            h('button', {
+              className: 'ar-btn', disabled: busy || rejectAll,
+              onClick: repairAll
+            }, busy ? '修复中…' : '全部修复')
+          )
+        ),
+
         // 当前诊断结论
         h('div', { className: 'ar-section-title' }, '当前诊断'),
         (d.findings || []).length
-          ? h('div', null, (d.findings || []).map((f, i) =>
-              h('div', { key: i, className: `ar-finding ${f.severity}` },
+          ? h('div', null, (d.findings || []).map((f, i) => {
+              const itemBusy = busyCode === f.code
+              const canRepair = f.fixable !== false && !rejectAll && !f.rejected
+              const handoff = f.handoff || null
+              return h('div', { key: i, className: `ar-finding ${f.severity}` },
                 h('div', { className: 'ar-finding-title' },
                   h('span', { className: 'ar-badge' }, f.code),
-                  f.title
+                  f.title,
+                  f.rejected ? h('span', { className: 'ar-flag rejected' }, '已忽略') : null,
+                  f.fixable ? null : h('span', { className: 'ar-flag' }, '不能自动修'),
+                  handoff && handoff.status === 'queued' ? h('span', { className: 'ar-flag agent' }, 'AI 处理中') : null
                 ),
-                h('div', { className: 'ar-finding-detail' }, f.detail || '')
+                h('div', { className: 'ar-finding-detail' }, f.detail || ''),
+                h('div', { className: 'ar-actions' },
+                  h('button', {
+                    className: 'ar-btn primary',
+                    disabled: itemBusy || !canRepair,
+                    onClick: () => repairOne(f.code)
+                  }, itemBusy ? '处理中…' : '修复'),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: itemBusy || rejectAll,
+                    onClick: () => askAgent(f.code)
+                  }, '让 AI 修'),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: itemBusy,
+                    onClick: () => toggleIgnore(f.code, !f.rejected)
+                  }, f.rejected ? '取消忽略' : '忽略')
+                ),
+                handoff && handoff.reply
+                  ? h('div', { className: 'ar-reply' }, handoff.reply)
+                  : null
               )
-            ))
+            }))
           : h('div', { className: 'ar-empty' }, '没有发现任何问题 —— 大肥鱼很健康 🐟'),
 
         // 修复历史
@@ -384,6 +586,9 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ar-note' },
           '这个面板只是「看」和「手动戳一下」。真正的自动修复由独立守护进程执行——',
           '因为 DSH 自己崩溃的时候，面板也跟着没了。',
+          h('br'),
+          '逐条审批模式下，守护进程只诊断不修；「让 AI 修」会拉起一个带本地工具的 DSH 会话，',
+          '由它自己复核问题、动手改、然后把总结写回这里。',
           h('br'),
           '手动诊断：',
           h('code', null, 'node D:\\大肥鱼\\auto-repair\\auto-repair.mjs --check')
