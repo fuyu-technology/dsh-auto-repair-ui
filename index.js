@@ -47,6 +47,7 @@ const AGENT_PATH = `${API_BASE}/agent-assist`
 const IGNORE_PATH = `${API_BASE}/ignore`
 const MODELS_PATH = `${API_BASE}/models`
 const CLIENTS_PATH = `${API_BASE}/clients`
+const PROVIDERS_PATH = `${API_BASE}/providers`
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // auto-repair 守护进程的实际位置。
@@ -441,6 +442,50 @@ function apply(ctx) {
     return base
   }
 
+  // ── 提供方接入信息（API 地址 / Key 状态） ────────────────────────────────
+  //
+  // Key 明文只在这一层进、这一层出：
+  //   - 进：面板 POST 上来，直接交给 ctx.credentials.set(ref, value)，
+  //         由 DSH 写进 ~/.dsh/.credentials.yaml（权限 600），**不落我们自己的文件**。
+  //   - 出：只给 describe() 的结果 + 尾 4 位（尾 4 位存在 ~/.dsh-auto-repair/ 下）。
+  //   任何返回值、日志里都不出现明文。
+  const KEY_ENV = Object.freeze({
+    minimax: 'MINIMAX_API_KEY',
+    'minimax-cn': 'MINIMAX_CN_API_KEY'
+  })
+  const PROVIDER_NAME = Object.freeze({
+    minimax: 'MiniMax（国际）',
+    'minimax-cn': 'MiniMax（国内）'
+  })
+
+  async function collectProviders() {
+    const r = await runCli(['--providers'], 20000)
+    const base = r.json
+    if (!base || base.ok === false || !base.providers) {
+      return { ok: false, error: base?.error || r.error || r.stderr || '读取接入信息失败', providers: [] }
+    }
+    const defaults = base.defaults || {}
+    const out = []
+    for (const [id, ref] of Object.entries(KEY_ENV)) {
+      const saved = base.providers[id] || {}
+      const info = await describeCredential(ref)
+      out.push({
+        id,
+        name: PROVIDER_NAME[id] || id,
+        keyEnv: ref,
+        baseUrl: saved.baseUrl || '',
+        defaultBaseUrl: saved.defaultBaseUrl || defaults[id] || '',
+        keyTail: saved.keyTail || '',
+        keyAt: saved.keyAt || 0,
+        managed: saved.managed === true,
+        hasKey: info ? info.configured === true : null,
+        keySource: info?.source || null,
+        writable: info ? info.writable !== false : null
+      })
+    }
+    return { ok: true, providers: out }
+  }
+
   disposers.push(webServer.register({
     kind: 'exact',
     path: STATUS_PATH,
@@ -655,6 +700,109 @@ function apply(ctx) {
     }
   }))
 
+  // ── 提供方接入信息：API 地址 / API Key（Key 只写进 DSH 凭据存储） ─────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: PROVIDERS_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        try {
+          sendJson(res, 200, await collectProviders())
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: e?.message || String(e), providers: [] })
+        }
+        return
+      }
+      if (method !== 'POST' && method !== 'PUT') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+
+      const body = await readBody(req)
+      const id = String(body.id || '').trim()
+      const ref = KEY_ENV[id]
+      if (!id || !ref) {
+        sendJson(res, 400, { ok: false, error: `不认识的提供方：${id || '(空)'}，只支持 ${Object.keys(KEY_ENV).join(' / ')}` })
+        return
+      }
+
+      // 1) 只做连通性探测
+      if (body.probe === true) {
+        const r = await runCli(['--probe-provider', JSON.stringify({
+          id,
+          ...(body.baseUrl !== undefined ? { baseUrl: String(body.baseUrl || '') } : {})
+        })], 20000)
+        const json = r.json
+        if (!json) {
+          sendJson(res, 200, { ok: false, error: r.error || r.stderr || '探测失败' })
+          return
+        }
+        sendJson(res, 200, { ...json, ...(await collectProviders()) })
+        return
+      }
+
+      // 2) 保存 API 地址（空串 = 清掉自定义地址，回到默认）
+      if (body.baseUrl !== undefined) {
+        const r = await runCli(['--set-provider', JSON.stringify({ id, baseUrl: String(body.baseUrl || '') })], 20000)
+        if (!r.json?.ok) {
+          sendJson(res, 200, { ok: false, error: r.json?.error || r.error || r.stderr || '地址保存失败' })
+          return
+        }
+      }
+
+      // 3) 保存 Key：明文只交给 DSH 凭据服务，这里不留任何副本
+      if (body.apiKey !== undefined) {
+        const key = String(body.apiKey || '').trim()
+        if (!key) {
+          sendJson(res, 200, { ok: false, error: '没有填 Key（要删除已保存的 Key 请点「清除」）' })
+          return
+        }
+        if (/\s/.test(key)) {
+          sendJson(res, 200, { ok: false, error: 'Key 里不能有空格或换行，可能粘贴时带进了多余字符' })
+          return
+        }
+        if (key.length < 8) {
+          sendJson(res, 200, { ok: false, error: `Key 太短（${key.length} 位），检查是不是复制漏了` })
+          return
+        }
+        const svc = credentialsOf()
+        if (!svc || typeof svc.set !== 'function') {
+          sendJson(res, 200, {
+            ok: false,
+            error: '当前 DSH 的凭据服务不支持写入，无法从面板保存 Key；请改用 ~/.dsh/.credentials.yaml 的 refs 配置'
+          })
+          return
+        }
+        try {
+          await svc.set(ref, key)
+        } catch (e) {
+          sendJson(res, 200, { ok: false, error: `写入 DSH 凭据失败：${e?.message || e}` })
+          return
+        }
+        await runCli(['--set-provider', JSON.stringify({ id, keyTail: key.slice(-4), keyAt: Date.now() })], 20000)
+      }
+
+      // 4) 清除已保存的 Key（同时清掉尾号记录）
+      if (body.clearKey === true) {
+        const svc = credentialsOf()
+        if (!svc || typeof svc.unset !== 'function') {
+          sendJson(res, 200, { ok: false, error: '当前 DSH 的凭据服务不支持写入，无法从面板清除 Key' })
+          return
+        }
+        try {
+          await svc.unset(ref)
+        } catch (e) {
+          sendJson(res, 200, { ok: false, error: `清除 DSH 凭据失败：${e?.message || e}` })
+          return
+        }
+        await runCli(['--set-provider', JSON.stringify({ id, clearKey: true })], 20000)
+      }
+
+      sendJson(res, 200, { ok: true, ...(await collectProviders()) })
+    }
+  }))
+
   // ── 忽略 / 取消忽略某一条 ─────────────────────────────────────────────────
   disposers.push(webServer.register({
     kind: 'exact',
@@ -683,7 +831,7 @@ function apply(ctx) {
   }
   if (typeof ctx?.effect === 'function') ctx.effect(() => dispose, `${NS}: api routes`)
   try {
-    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${MODELS_PATH}, ${CLIENTS_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
+    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${MODELS_PATH}, ${CLIENTS_PATH}, ${PROVIDERS_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
   } catch {}
   return dispose
 }

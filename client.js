@@ -299,6 +299,11 @@ window.__ModuleLoader__.load({
       const [clients, setClients] = useState(null)
       const [clientsBusy, setClientsBusy] = useState(false)
       const [clientDraft, setClientDraft] = useState({})
+      // 各提供方的 API 地址 / Key 状态（Key 只拿尾 4 位，不拿明文）
+      const [providers, setProviders] = useState(null)
+      const [providersBusy, setProvidersBusy] = useState(false)
+      const [baseDraft, setBaseDraft] = useState({})
+      const [keyDraft, setKeyDraft] = useState({})
       const timerRef = useRef(null)
 
       const load = useCallback(async (silent) => {
@@ -347,6 +352,59 @@ window.__ModuleLoader__.load({
       }, [])
 
       useEffect(() => { loadClients() }, [loadClients])
+
+      /** 读各提供方的 API 地址 / Key 状态（永远不含 Key 明文） */
+      const loadProviders = useCallback(async () => {
+        try {
+          const r = await fetchJson('/providers', { cache: 'no-store' })
+          setProviders(r)
+        } catch (e) {
+          setProviders({ ok: false, error: e?.message || String(e), providers: [] })
+        }
+      }, [])
+
+      useEffect(() => { loadProviders() }, [loadProviders])
+
+      /** 保存 API 地址 / Key，或清除 Key（apiKey 明文只在这一次请求里出现） */
+      const saveProvider = useCallback(async (id, patch, okText) => {
+        setProvidersBusy(true)
+        setToast(null)
+        try {
+          const r = await postJson('/providers', { id, ...patch })
+          if (r?.ok === false) {
+            setToast({ ok: false, text: String(r.error || '保存失败') })
+          } else {
+            setProviders({ ok: true, providers: r?.providers || [] })
+            setKeyDraft((d) => ({ ...d, [id]: '' }))
+            setBaseDraft((d) => ({ ...d, [id]: undefined }))
+            setToast({ ok: true, text: okText || '已保存' })
+          }
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setProvidersBusy(false)
+        }
+      }, [])
+
+      /** 轻量连通性探测（不带 Key，避免把密钥发到填错的地址） */
+      const probeProvider = useCallback(async (id) => {
+        setProvidersBusy(true)
+        setToast(null)
+        try {
+          const draft = baseDraft[id]
+          const r = await postJson('/providers', {
+            id,
+            probe: true,
+            ...(draft !== undefined ? { baseUrl: draft } : {})
+          })
+          if (r?.providers) setProviders({ ok: true, providers: r.providers })
+          setToast({ ok: r?.ok === true, text: r?.ok ? String(r.detail || '地址可达') : String(r?.error || '连不上') })
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setProvidersBusy(false)
+        }
+      }, [baseDraft])
 
       /** 改客户端路径 / 关联启动开关（改完用返回的新扫描结果直接覆盖，省一次请求） */
       const updateClient = useCallback(async (id, patch) => {
@@ -542,6 +600,9 @@ window.__ModuleLoader__.load({
       const modelProviders = Array.isArray(models?.providers) ? models.providers : []
       const modelWarnings = Array.isArray(models?.warnings) ? models.warnings : []
       const modelError = models && models.ok === false ? String(models.error || '读不到模型列表') : ''
+      // API 地址 / Key 卡片用的数据
+      const providerList = Array.isArray(providers?.providers) ? providers.providers : []
+      const providerError = providers && providers.ok === false ? String(providers.error || '读不到接入信息') : ''
       const curModel = models?.current || null
       // selected 只在用户真的选过时才有值：没选过就停在「跟随 DSH 默认」，
       // 不再默认把 deepseek 那一项顶上去。
@@ -703,6 +764,79 @@ window.__ModuleLoader__.load({
           modelWarnings.length ? h('div', { className: 'ar-warnbox' }, modelWarnings.join('\n')) : null
         ),
 
+        // ── API 地址与 Key（MiniMax 等需要 Key 的提供方） ────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, 'API 地址与 Key'),
+            h('span', { className: 'ar-policy-hint' },
+              '填了就用面板里填的；留空则沿用 DSH 自己的凭据（.credentials.yaml 的 refs 或环境变量）。Key 只写进 DSH 凭据存储，面板只显示尾 4 位。')
+          ),
+          providerError ? h('div', { className: 'ar-warnbox' }, providerError) : null,
+          h('div', { className: 'ar-client-list' },
+            providerList.map((p) => {
+              const baseVal = baseDraft[p.id] !== undefined ? baseDraft[p.id] : p.baseUrl
+              const keyVal = keyDraft[p.id] || ''
+              const keyState = p.hasKey === true
+                ? (p.keyTail ? `已配置 · 尾号 ${p.keyTail}` : '已配置（来自 DSH 凭据 / 环境变量）')
+                : p.hasKey === false
+                  ? '未配置'
+                  : '读不到状态'
+              return h('div', { className: 'ar-client-row', key: p.id },
+                h('div', { className: 'ar-client-head' },
+                  h('span', { className: 'ar-client-name' }, p.name),
+                  h('span', { className: `ar-flag${p.hasKey === true ? ' agent' : ''}` }, keyState)
+                ),
+                h('div', { className: 'ar-client-path' }, `凭据名：${p.keyEnv}${p.defaultBaseUrl ? ` · 默认地址：${p.defaultBaseUrl}` : ''}`),
+                h('div', { className: 'ar-row', style: { marginTop: '6px' } },
+                  h('input', {
+                    className: 'ar-input',
+                    type: 'text',
+                    value: baseVal,
+                    placeholder: p.defaultBaseUrl || 'https://…',
+                    disabled: providersBusy,
+                    spellCheck: false,
+                    onChange: (e) => setBaseDraft((d) => ({ ...d, [p.id]: e.target.value }))
+                  }),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: providersBusy,
+                    onClick: () => saveProvider(p.id, { baseUrl: baseVal }, `${p.name}：API 地址已保存`)
+                  }, '保存地址'),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: providersBusy,
+                    onClick: () => probeProvider(p.id)
+                  }, '测试连通')
+                ),
+                h('div', { className: 'ar-row', style: { marginTop: '6px' } },
+                  h('input', {
+                    className: 'ar-input',
+                    type: 'password',
+                    value: keyVal,
+                    placeholder: p.hasKey === true ? '留空则不修改（已配置）' : '粘贴 API Key',
+                    autoComplete: 'new-password',
+                    disabled: providersBusy,
+                    onChange: (e) => setKeyDraft((d) => ({ ...d, [p.id]: e.target.value }))
+                  }),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: providersBusy || !keyVal,
+                    onClick: () => saveProvider(p.id, { apiKey: keyVal }, `${p.name}：Key 已保存`)
+                  }, '保存 Key'),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: providersBusy || p.hasKey !== true,
+                    onClick: () => saveProvider(p.id, { clearKey: true }, `${p.name}：Key 已清除`)
+                  }, '清除')
+                )
+              )
+            })
+          ),
+          providerList.length === 0 && providers
+            ? h('div', { className: 'ar-policy-hint' }, '当前没有需要填 Key 的提供方。')
+            : null
+        ),
+
         // ── 本机模型客户端（扫描 + 可选关联启动） ──────────────────────────
         h('div', { className: 'ar-policy' },
           h('div', { className: 'ar-policy-head' },
@@ -857,8 +991,8 @@ window.__ModuleLoader__.load({
           '并把报错自动投喂进那个会话的输入框（标「已升级给模型」）。同一报错 30 分钟内只投喂一次；',
           '缺 Key、路由未启用这类配置问题只提示、不投喂。',
           h('br'),
-          '「AI 模型」卡片决定下一次「让 AI 修」用哪个模型；MiniMax 的 Key 由 DSH 凭据系统管理，',
-          '面板本身不存密钥。',
+          '「AI 模型」卡片决定下一次「让 AI 修」用哪个模型；「API 地址与 Key」卡片可以把 Key 直接填在这里，',
+          '值只写进 DSH 凭据存储（.credentials.yaml，权限 600），面板与日志只保留尾 4 位。留空则沿用原有配置。',
           h('br'),
           '「本机模型客户端」卡片只做发现与可选关联启动：勾了「关联启动」才会在投喂前拉起对应客户端，',
           '默认全关；扫不到就显示「未检测到」，也可以手填 .exe 完整路径。',

@@ -19,6 +19,7 @@ DeepSeek Harness 插件：把「自愈守护进程」搬进 DSH 设置页。装�
 - **自动投喂报错**：插件修不动的报错，自动送进选中模型的会话输入框；可关（v1.3.0）
 - **路径可见**：每条问题标出「插件已修复」还是「已升级给模型」，不用猜（v1.3.0）
 - **客户端发现**：扫描本机 TRAE / MiniMax 客户端，可选手动改路径与「关联启动」（v1.4.0）
+- **API 地址与 Key**：面板上直接填 API Base URL / API Key，Key 只写进 DSH 凭据存储、只显示尾 4 位（v1.5.0）
 
 ## 本机模型客户端（v1.4.0）
 
@@ -117,10 +118,41 @@ refs:
 
 3. 用同名 Windows 用户环境变量。
 
+或者**直接在面板上填**（v1.5.0）：见下一节。
+
 改完 profile 或凭据后**需要重启 DSH** 才会加载 MiniMax 路由。
 
 缺 Key 时不会静默失败：模型选项会标「缺 Key」，面板会显示明确提示，
 点「让 AI 修」也会在拉起会话前直接返回「需要 MINIMAX_API_KEY」的错误说明。
+
+## API 地址与 Key（v1.5.0）
+
+面板新增「API 地址与 Key」卡片，按提供方各给一组输入：
+
+| 能力 | 说明 |
+|---|---|
+| API Base URL | 填了就用面板里的地址；留空回落到该提供方的默认地址（`minimax` → `https://api.minimax.io/anthropic`，`minimax-cn` → `https://api.minimaxi.com/anthropic`）。保存前校验协议/主机名，不合法直接给出原因 |
+| API Key | 填了就用面板里的 Key；留空则不修改，沿用原有 `.credentials.yaml` / 环境变量 |
+| 遮蔽显示 | 输入框是 `type=password`；已保存的只显示「已配置 · 尾号 abcd」，永不回显明文 |
+| 清除 | 每个提供方一个「清除」按钮，删掉 DSH 凭据里的对应 ref，并清掉尾号记录 |
+| 连通性 | 「测试连通」做一次 GET 探测（**不带 Key**，避免把密钥发到填错的地址）；能拿到任何 HTTP 状态码即视为可达，401/403 会说明「需要有效 Key」 |
+
+**Key 存到哪**
+
+- 明文只写进 DSH 自己的凭据存储：`~/.dsh/.credentials.yaml` 的 `refs` 段，
+  由 `ctx.credentials.set(ref, value)` 写入，文件权限由 DSH 强制 `600`。
+- 面板自己的记录在 `~/.dsh-auto-repair/provider-endpoints.json`，**只有地址 + 尾 4 位 + 设置时间 + 是否面板设置**，
+  没有任何密钥明文；该目录**不在 git 仓库里**，也不写进 README 或日志。
+- 权限：目录 `700`、文件 `600`；Windows 上额外用 `icacls` 去掉继承、只保留当前用户与 SYSTEM。
+- 面板保存 Key 后 DSH 会收到凭据更新通知，下一次模型调用即生效，不用重启；路由本身没加载时才需要重启 DSH。
+
+命令行等价物：
+
+```bash
+node auto-repair.mjs --providers          # 看地址 / Key 状态（不含明文）
+node auto-repair.mjs --set-provider '{"id":"minimax","baseUrl":"https://api.minimaxi.com/anthropic"}'
+node auto-repair.mjs --probe-provider '{"id":"minimax"}'
+```
 
 ## 审批策略
 
@@ -225,6 +257,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | GET / POST / PUT | `/dsh-auto-repair/policy` | 读 / 写审批策略（`mode`、`agentAssist`、`autoFeed`） |
 | GET / POST | `/dsh-auto-repair/models` | 读模型目录 / 切换「让 AI 修」用的模型（body: `provider`、`model`） |
 | GET / POST | `/dsh-auto-repair/clients` | 扫描本机客户端 / 改路径或开关（body: `id`、`path`、`launch`） |
+| GET / POST | `/dsh-auto-repair/providers` | 各提供方的 API 地址 / Key 状态；body: `id` + `baseUrl` / `apiKey` / `clearKey` / `probe` |
 | POST | `/dsh-auto-repair/repair-one` | 修指定的单条（body: `code`） |
 | POST | `/dsh-auto-repair/repair-all` | 修补所有可修项 |
 | POST | `/dsh-auto-repair/agent-assist` | 把某条交给 AI（body: `code`） |
@@ -232,8 +265,11 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 
 ## 版本与兼容性
 
-当前版本 **1.4.0**。
+当前版本 **1.5.0**。
 
+- 1.5.0 新增：「API 地址与 Key」卡片（按提供方填 Base URL / Key，Key 走 DSH 凭据存储，
+  面板只显示尾 4 位，可清除，地址校验 + 不带 Key 的连通性探测），
+  以及 `/dsh-auto-repair/providers` 接口与 `--providers` / `--set-provider` / `--probe-provider` 命令
 - 1.4.0 新增：本机模型客户端自动扫描（注册表 / 开始菜单 / 常见目录）、手动路径覆盖、
   按客户端配置的「关联启动」开关；模型下拉默认停在「跟随 DSH 默认」，不再默认选中 deepseek
 - 1.3.0 新增：`autoFeed` 自动投喂开关（默认开）、报错特征哈希 + 30 分钟去重、
