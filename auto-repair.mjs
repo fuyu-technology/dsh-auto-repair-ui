@@ -35,6 +35,9 @@
 //   node auto-repair.mjs --set-model '{"provider":"minimax","model":"MiniMax-M3"}'
 //   node auto-repair.mjs --scan-clients # 扫本机装了哪些模型客户端（TRAE / MiniMax）
 //   node auto-repair.mjs --set-client '{"id":"trae","path":"D:\\...\\Trae CN.exe","launch":true}'
+//   node auto-repair.mjs --providers                       # 各提供方的 API 地址 / Key 状态（不含明文）
+//   node auto-repair.mjs --set-provider '{"id":"minimax","baseUrl":"https://api.minimaxi.com/anthropic"}'
+//   node auto-repair.mjs --probe-provider '{"id":"minimax","baseUrl":"https://api.minimaxi.com/anthropic"}'
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -47,6 +50,7 @@ import { readPolicy, writePolicy, canAutoRepair, isRejected, MODES } from './pol
 import { readHandoffs, writeHandoff, feedHashOf, shouldFeed, markFed } from './agent-repair.mjs'
 import { listModels, readChoice, writeChoice, findModel, readinessOf } from './models.mjs'
 import { scanClients, setClient } from './clients.mjs'
+import { publicEndpoints, patchEndpoint, validateBaseUrl, probeEndpoint, PROVIDER_DEFAULT_BASE } from './providers.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const STATE = path.join(HERE, 'state')
@@ -72,7 +76,8 @@ const argOf = (name, fallback = '') => {
 // 所以那时日志只落文件，不写 stdout。
 const JSON_ONLY = ARGS.some((a) =>
   ['--check', '--repair', '--repair-all', '--agent', '--get-policy', '--set-policy',
-    '--models', '--get-model', '--set-model', '--scan-clients', '--set-client'].includes(a)
+    '--models', '--get-model', '--set-model', '--scan-clients', '--set-client',
+    '--providers', '--set-provider', '--probe-provider'].includes(a)
 )
 const QUIET_STDOUT = JSON_ONLY
 
@@ -588,6 +593,58 @@ if (ARGS.includes('--set-client')) {
   }
   const r = setClient(id, { path: req.path, launch: req.launch })
   console.log(JSON.stringify(r))
+  process.exit(0)
+}
+
+// 提供方接入信息：API 地址 + Key 是否已配置（永不输出明文）
+if (ARGS.includes('--providers')) {
+  console.log(JSON.stringify({ ok: true, providers: publicEndpoints(), defaults: PROVIDER_DEFAULT_BASE }))
+  process.exit(0)
+}
+
+// 保存某个提供方的接入信息（baseUrl / Key 尾号标记），Key 明文不经过这里
+if (ARGS.includes('--set-provider')) {
+  const raw = argOf('--set-provider')
+  let req = {}
+  try { req = JSON.parse(raw || '{}') } catch { req = {} }
+  const id = String(req.id || '').trim()
+  if (!id) {
+    console.log(JSON.stringify({ ok: false, error: '需要 id（minimax / minimax-cn）' }))
+    process.exit(0)
+  }
+  let baseUrl
+  if (req.baseUrl !== undefined) {
+    const v = validateBaseUrl(req.baseUrl)
+    if (!v.ok) {
+      console.log(JSON.stringify({ ok: false, error: v.error }))
+      process.exit(0)
+    }
+    baseUrl = v.value
+  }
+  try {
+    const doc = patchEndpoint(id, {
+      ...(baseUrl !== undefined ? { baseUrl } : {}),
+      ...(req.keyTail !== undefined ? { keyTail: req.keyTail, keyAt: req.keyAt || Date.now(), managed: true } : {}),
+      ...(req.clearKey ? { keyTail: '', keyAt: 0, managed: false } : {})
+    })
+    console.log(JSON.stringify({ ok: true, provider: doc.providers[id] || null }))
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: e?.message || String(e) }))
+  }
+  process.exit(0)
+}
+
+// 轻量连通性探测（不带 Key，避免把密钥发到填错的地址）
+if (ARGS.includes('--probe-provider')) {
+  const raw = argOf('--probe-provider')
+  let req = {}
+  try { req = JSON.parse(raw || '{}') } catch { req = {} }
+  const id = String(req.id || '').trim()
+  const explicit = req.baseUrl !== undefined ? String(req.baseUrl || '') : undefined
+  const stored = publicEndpoints()[id] || {}
+  const target = explicit !== undefined ? explicit : (stored.baseUrl || stored.defaultBaseUrl || '')
+  const r = await probeEndpoint(target)
+  console.log(JSON.stringify({ ok: r.ok === true, provider: id || null, ...r }))
   process.exit(0)
 }
 

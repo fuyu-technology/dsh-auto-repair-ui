@@ -6,8 +6,11 @@
 //   1. 可选模型**只列真实存在的**：优先读 DSH 的 session/modelCatalog；
 //      DSH 连不上时，回落到这里的内置清单（DeepSeek 来自 DSH 目录，
 //      MiniMax 来自 DSH 内置的 pi-ai 提供方目录，不是编出来的名字）。
-//   2. 这里**只存 provider/model**，不碰任何密钥。MiniMax 的 Key 由 DSH
-//      凭据系统按名解析（MINIMAX_API_KEY / MINIMAX_CN_API_KEY）。
+//   2. 模型选择文件（state/model-choice.json）**只存 provider/model**。
+//      1.5.0 起面板可以填 API Key：Key 的明文交给 DSH 凭据存储
+//      （~/.dsh/.credentials.yaml 的 refs，经 ctx.credentials.set 写入），
+//      本目录只留尾 4 位与设置时间（~/.dsh-auto-repair/provider-endpoints.json）。
+//      这里以及任何日志都不读取、不打印、不保存密钥值。
 
 import fs from 'node:fs'
 import os from 'node:os'
