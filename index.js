@@ -45,6 +45,7 @@ const REPAIR_ONE_PATH = `${API_BASE}/repair-one`
 const REPAIR_ALL_PATH = `${API_BASE}/repair-all`
 const AGENT_PATH = `${API_BASE}/agent-assist`
 const IGNORE_PATH = `${API_BASE}/ignore`
+const MODELS_PATH = `${API_BASE}/models`
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // auto-repair 守护进程的实际位置。
@@ -140,6 +141,7 @@ function readPolicyFile() {
   return {
     mode: ['manual', 'approve-all', 'reject-all'].includes(String(src.mode)) ? String(src.mode) : 'manual',
     agentAssist: src.agentAssist !== false,
+    autoFeed: src.autoFeed !== false,
     rejectedCodes: Array.isArray(src.rejectedCodes) ? src.rejectedCodes.map(String) : [],
     updatedAt: Number(src.updatedAt) || 0
   }
@@ -150,6 +152,22 @@ async function writePolicy(patch) {
   const r = await runCli(['--set-policy', JSON.stringify(patch)], 20000)
   if (r.json?.policy) return { ok: true, policy: r.json.policy }
   return { ok: false, error: r.json?.error || r.error || r.stderr || '改策略失败' }
+}
+
+/** 「让 AI 修」用哪个模型：选择本身存在 state/model-choice.json */
+function readModelChoiceFile() {
+  const doc = readJson(path.join(REPAIR_STATE, 'model-choice.json'), null)
+  const src = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : {}
+  const provider = String(src.provider || '').trim()
+  const model = String(src.model || '').trim()
+  if (!provider || !model) return null
+  return { provider, model, updatedAt: Number(src.updatedAt) || 0 }
+}
+
+// 需要 Key 的提供方：Key 不落配置、不落代码，由 DSH 凭据系统按名解析。
+const PROVIDER_KEY_ENV = {
+  minimax: 'MINIMAX_API_KEY',
+  'minimax-cn': 'MINIMAX_CN_API_KEY'
 }
 
 /** 守护进程是否在跑（读它自己的 pid 锁） */
@@ -321,6 +339,94 @@ function apply(ctx) {
 
   const disposers = []
 
+  /** DSH 凭据服务（用于「Key 配了没」的只读描述，绝不读取值本身） */
+  function credentialsOf() {
+    try {
+      return (typeof ctx?.get === 'function' ? ctx.get('credentials') : undefined) || ctx?.credentials
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 描述一个凭据引用：{configured, source, writable}，读不到返回 null */
+  async function describeCredential(ref) {
+    const svc = credentialsOf()
+    if (!svc || typeof svc.describe !== 'function') return null
+    try {
+      const info = await svc.describe(ref)
+      return {
+        configured: info?.configured === true,
+        source: info?.source || null,
+        writable: info?.writable !== false
+      }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 这个模型此刻能不能用（用于面板上「自动投喂」的状态提示）。
+   * 与守护进程 models.mjs 的判定口径一致：缺 Key / 路由未启用 / 模型不存在都算不可用。
+   */
+  function readinessFromProviders(providers, provider, model) {
+    const group = (providers || []).find((p) => p.id === provider)
+    if (!group) return { ok: false, code: 'UNKNOWN_PROVIDER', reason: `没有 ${provider} 这个提供方` }
+    if (!(group.models || []).some((m) => m.id === model)) {
+      return { ok: false, code: 'UNKNOWN_MODEL', reason: `${provider} 下没有 ${model} 这个模型` }
+    }
+    if (group.available === false) {
+      return { ok: false, code: 'ROUTE_DOWN', reason: `${group.name || provider} 路由还没加载（多半是改了配置但没重启 DSH）` }
+    }
+    if (group.keyConfigured === false) {
+      return { ok: false, code: 'NO_KEY', reason: `缺少 ${group.keyEnv}：在 DSH 设置里配置，或写进 .dsh/.credentials.yaml 的 refs，然后重启 DSH` }
+    }
+    return { ok: true, code: null, reason: '可用' }
+  }
+
+  /**
+   * 模型目录 = 守护进程读到的 DSH 实时目录 + 内置兜底清单，
+   * 再由宿主侧补上「Key 配了没」的状态与提示。
+   */
+  async function collectModels() {
+    const r = await runCli(['--models'], 30000)
+    const base = r.json
+    if (!base || base.ok === false) {
+      return {
+        ok: false,
+        error: base?.error || r.error || r.stderr || '读不到模型列表',
+        providers: [],
+        current: readModelChoiceFile(),
+        warnings: []
+      }
+    }
+
+    const warnings = []
+    for (const p of base.providers || []) {
+      // 路由还没加载（多半是没重启 DSH）：先说明这个，不再叠加 Key 提示
+      if (p.available === false) {
+        warnings.push(`${p.name} 路由尚未加载：确认 DSH profile 已挂载 @deepseek-ai/dsh-llm-pi-ai，重启 DSH 后才会生效。`)
+        continue
+      }
+      if (!p.keyEnv) continue
+      const info = await describeCredential(p.keyEnv)
+      p.key = info
+      p.keyConfigured = info ? info.configured : null
+      if (info && !info.configured) {
+        warnings.push(`缺少 ${p.name} 的 API Key（${p.keyEnv}）：在 DSH 设置里配置，或写进 .dsh/.credentials.yaml 的 refs 下，然后重启 DSH。`)
+      } else if (!info) {
+        warnings.push(`读不到 ${p.keyEnv} 的配置状态（凭据服务不可用），请自行确认该 Key 已在 DSH 里配置。`)
+      }
+    }
+    if (base.catalogError) {
+      warnings.push(`DSH 模型目录读取失败：${base.catalogError}（下列模型来自内置兜底清单）`)
+    }
+
+    const cur = base.current || null
+    const readiness = cur ? readinessFromProviders(base.providers || [], cur.provider, cur.model) : null
+
+    return { ...base, warnings: [...new Set(warnings)], readiness }
+  }
+
   disposers.push(webServer.register({
     kind: 'exact',
     path: STATUS_PATH,
@@ -375,6 +481,7 @@ function apply(ctx) {
         const patch = {}
         if (body.mode !== undefined) patch.mode = String(body.mode)
         if (body.agentAssist !== undefined) patch.agentAssist = body.agentAssist === true
+        if (body.autoFeed !== undefined) patch.autoFeed = body.autoFeed === true
         if (!Object.keys(patch).length) {
           sendJson(res, 400, { ok: false, error: '没有要改的字段' })
           return
@@ -438,9 +545,60 @@ function apply(ctx) {
         sendJson(res, 400, { ok: false, error: '缺少 code' })
         return
       }
+
+      // 缺 Key 时先把话说清楚，别让 agent 会话建出来才发现发不出请求。
+      const choice = readModelChoiceFile()
+      const keyEnv = choice ? PROVIDER_KEY_ENV[choice.provider] : null
+      if (keyEnv) {
+        const info = await describeCredential(keyEnv)
+        if (info && !info.configured) {
+          sendJson(res, 200, {
+            ok: false,
+            error: `当前模型 ${choice.provider}/${choice.model} 需要 ${keyEnv}，但 DSH 里没有配置这个 Key。请补上后重启 DSH，或在面板里换成别的模型。`
+          })
+          return
+        }
+      }
+
       const r = await runCli(['--agent', code], 60000)
       const json = r.json || { ok: false, error: r.error || r.stderr || '拉起 AI 失败' }
-      sendJson(res, 200, json)
+      // route=model：这次走的是「升级给模型」这条路，面板据此打标记
+      sendJson(res, 200, { ...json, route: json?.ok ? 'model' : null })
+    }
+  }))
+
+  // ── AI 模型选择（「让 AI 修」用哪个提供方/模型） ───────────────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: MODELS_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        try {
+          sendJson(res, 200, await collectModels())
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: e?.message || String(e), providers: [], warnings: [] })
+        }
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        const provider = String(body.provider || '').trim()
+        const model = String(body.model || '').trim()
+        if (!provider || !model) {
+          sendJson(res, 400, { ok: false, error: '缺少 provider 或 model' })
+          return
+        }
+        const r = await runCli(['--set-model', JSON.stringify({ provider, model })], 30000)
+        const json = r.json
+        if (!json?.ok) {
+          sendJson(res, 200, { ok: false, error: json?.error || r.error || r.stderr || '切换模型失败' })
+          return
+        }
+        sendJson(res, 200, { ok: true, current: json.current })
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
     }
   }))
 
@@ -472,7 +630,7 @@ function apply(ctx) {
   }
   if (typeof ctx?.effect === 'function') ctx.effect(() => dispose, `${NS}: api routes`)
   try {
-    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
+    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${MODELS_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
   } catch {}
   return dispose
 }

@@ -15,6 +15,95 @@ DeepSeek Harness 插件：把「自愈守护进程」搬进 DSH 设置页。装�
 - **agentAssist 开关**：修不了的时候要不要交给 DSH agent 继续查（v1.1.0）
 - **逐条处置**：单条修复、忽略、交给 AI（v1.1.0）
 - **全部修复**：一次把所有能自动修的修完（v1.1.0）
+- **AI 模型选择**：面板上直接选「让 AI 修」用哪个提供方/模型，已接入 MiniMax（v1.2.0）
+- **自动投喂报错**：插件修不动的报错，自动送进选中模型的会话输入框；可关（v1.3.0）
+- **路径可见**：每条问题标出「插件已修复」还是「已升级给模型」，不用猜（v1.3.0）
+
+## 自动投喂报错
+
+守护进程的处理是一个阶梯，**能自己修的绝不拉模型**：
+
+1. 有对应修复器、且策略允许 → 插件自己修。修好即结束，不建任何模型会话，不烧额度。
+2. 修失败，或者压根没有修复器 → 才升级给模型：新建一个 DSH 会话，把报错原文投喂进去。
+3. 面板上每条问题会标出这次走的是哪条路：「插件已修复」或「已升级给模型（模型名）」。
+
+投喂的细节：
+
+| 关注点 | 做法 |
+|---|---|
+| 开关 | 策略字段 `autoFeed`，默认开；关掉后只展示、不投喂。手动点「让 AI 修」不受它限制 |
+| 只有一种能力 | DSH 的 `session/prompt` 没有「只填输入框不发送」，所以是直接发送；消息开头标 `【自动投喂·自愈面板】` |
+| 截断 | 提示词全文硬上限 3000 字，超了截断并注明「完整内容见 state/auto-repair.log」 |
+| 去重 | 按 `code + 级别 + 现象文本` 的特征哈希记账，30 分钟窗口内同一报错只投喂一次 |
+| 配置问题 | 缺 Key、路由未启用、模型不存在 → 只提示不投喂（灌进去也只会再报一次） |
+
+去重账本在 `<REPAIR_DIR>/state/feed-state.json`，路径记录在 `<REPAIR_DIR>/state/repair-outcomes.json`。
+
+## AI 模型选择
+
+面板的「AI 模型」卡片可以选下一次「让 AI 修」用哪个提供方/模型。选择结果写回
+`<REPAIR_DIR>/state/model-choice.json`，下一次点「让 AI 修」时由 `agent-repair.mjs`
+调 DSH 的 `sessions.selectModel` 应用到这个会话上——不是只存个下拉框的摆设。
+
+没选过时跟随 DSH 自己的默认模型（`agent-default-model`），面板会标成「跟随 DSH 默认」。
+
+选项来源：
+
+- 优先读 DSH 的实时模型目录（`session/modelCatalog`）；
+- DSH 连不上时回落到内置兜底清单，仍然只列真实存在的模型名（DeepSeek 来自 DSH 目录，
+  MiniMax 来自 DSH 自带的 pi-ai 提供方目录），不编造模型。
+
+目前可选：
+
+| 提供方 | 模型 | 需要 Key |
+|---|---|---|
+| `deepseek-account` | `deepseek-flash`、`deepseek-v4-pro` | 否（DSH 账号已登录） |
+| `minimax` | `MiniMax-M2.7`、`MiniMax-M2.7-highspeed`、`MiniMax-M3` | `MINIMAX_API_KEY` |
+| `minimax-cn` | 同上（走 `api.minimaxi.com`） | `MINIMAX_CN_API_KEY` |
+
+### MiniMax 接入方式
+
+MiniMax 走 DSH 自带的 `@deepseek-ai/dsh-llm-pi-ai` 提供方，**没有新增第三方依赖**。
+本插件自带的 `cordis.patch.yml` 已经在 **bundle 层**注册好这两条路由（插件升级后自动生效，
+不需要手改 profile）：
+
+```yaml
+- insert:
+    - id: llm-pi-ai
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers:
+          minimax:
+            apiKeyEnv: MINIMAX_API_KEY
+            displayName: MiniMax
+          minimax-cn:
+            apiKeyEnv: MINIMAX_CN_API_KEY
+            displayName: MiniMax 中国站
+```
+
+> 为什么不写进 `~/.dsh/profiles/desktop/cordis.patch.yml`：DSH 保存设置时会重写 profile patch
+> 并抹掉它不管理的行（见 `auto-repair/README.md` 里「QQ 桥接掉了」的根因）。bundle 层只在启动时
+> 读取、永不被写回，所以注册沉到插件的 `cordis.patch.yml`。
+
+### MiniMax Key 填在哪
+
+**密钥不进代码、不进仓库、也不进配置文件的明文里。** 三种方式任选：
+
+1. 在 DSH 设置里配置凭据 `MINIMAX_API_KEY`（中国站 `MINIMAX_CN_API_KEY`）；
+2. 写进 `~/.dsh/.credentials.yaml` 的 `refs` 下：
+
+```yaml
+refs:
+  MINIMAX_API_KEY: <你的 MiniMax Key>
+  # 中国站再补：MINIMAX_CN_API_KEY: <key>
+```
+
+3. 用同名 Windows 用户环境变量。
+
+改完 profile 或凭据后**需要重启 DSH** 才会加载 MiniMax 路由。
+
+缺 Key 时不会静默失败：模型选项会标「缺 Key」，面板会显示明确提示，
+点「让 AI 修」也会在拉起会话前直接返回「需要 MINIMAX_API_KEY」的错误说明。
 
 ## 审批策略
 
@@ -76,6 +165,9 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | `auto-repair.mjs` | 巡检 + 修复的执行体，**必须在 DSH 进程树之外**常驻 |
 | 守护进程状态文件 | `<REPAIR_DIR>/state/auto-repair.pid` |
 | 策略文件 | `<REPAIR_DIR>/state/repair-policy.json`（不存在时按默认策略处理） |
+| 模型选择文件 | `<REPAIR_DIR>/state/model-choice.json`（只存 provider/model；不存在时跟随 DSH 默认） |
+| 投喂去重账本 | `<REPAIR_DIR>/state/feed-state.json` |
+| 路径记录 | `<REPAIR_DIR>/state/repair-outcomes.json`（插件修好的 / 升级给模型的） |
 
 没有守护进程时，面板会显示「守护进程不在」——这是正常的，不是面板坏了。
 
@@ -96,9 +188,11 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 |---|---|---|
 | `mode` | string | `manual` / `approve-all` / `reject-all` |
 | `agentAssist` | boolean | 修不了时是否交给 DSH agent |
+| `autoFeed` | boolean | 修不动时是否把报错自动投喂进模型会话（默认 `true`） |
 | `rejectedCodes` | string[] | 逐条忽略过的故障 code |
 
-面板写策略一律通过守护进程的 `--set-policy`，保证合并语义只在 `policy.mjs` 一处实现。
+面板写策略一律通过守护进程的 `--set-policy`，保证合并语义只在 `policy.mjs` 一处实现；
+模型选择通过 `--set-model`，目录与可选模型只在 `models.mjs` 一处实现。
 
 ## API
 
@@ -110,7 +204,8 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | GET | `/dsh-auto-repair/diagnose` | 跑一遍诊断，返回结论列表 |
 | POST | `/dsh-auto-repair/repair` | 手动触发一次修复 |
 | GET | `/dsh-auto-repair/history` | 修复历史与频次计数 |
-| GET / POST / PUT | `/dsh-auto-repair/policy` | 读 / 写审批策略（`mode`、`agentAssist`） |
+| GET / POST / PUT | `/dsh-auto-repair/policy` | 读 / 写审批策略（`mode`、`agentAssist`、`autoFeed`） |
+| GET / POST | `/dsh-auto-repair/models` | 读模型目录 / 切换「让 AI 修」用的模型（body: `provider`、`model`） |
 | POST | `/dsh-auto-repair/repair-one` | 修指定的单条（body: `code`） |
 | POST | `/dsh-auto-repair/repair-all` | 修补所有可修项 |
 | POST | `/dsh-auto-repair/agent-assist` | 把某条交给 AI（body: `code`） |
@@ -118,12 +213,18 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 
 ## 版本与兼容性
 
-当前版本 **1.1.0**。
+当前版本 **1.3.0**。
 
+- 1.3.0 新增：`autoFeed` 自动投喂开关（默认开）、报错特征哈希 + 30 分钟去重、
+  提示词 3000 字硬截断与 `【自动投喂·自愈面板】` 标记、配置类问题（缺 Key / 路由未启用）
+  只提示不投喂，以及面板上的「插件已修复 / 已升级给模型」路径标记
+- 1.2.0 新增：面板「AI 模型」选择、模型目录透传、MiniMax（`minimax` / `minimax-cn`）接入，
+  以及 `/dsh-auto-repair/models` 接口；选择真正传进 `agent-repair` 的 `sessions.selectModel`
 - 1.1.0 新增：审批策略三档、`agentAssist`、逐条处置、全部修复，以及上表中后 5 个接口
 - 1.0.0 的行为相当于 1.1.0 手动模式：不自动修、不拉起 AI，只有状态 / 诊断 / 历史 / 手动修复
 - 原有接口路径未变，属向后兼容的增量更新
-- 依赖宿主守护进程支持 `--repair <code>`、`--repair-all`、`--agent <code>`、`--set-policy`；宿主较旧时策略区会读不到数据，但状态、诊断、历史、手动修复仍可用
+- 依赖宿主守护进程支持 `--repair <code>`、`--repair-all`、`--agent <code> [--auto]`、`--set-policy`、
+  `--models`、`--set-model`；宿主较旧时模型卡片会显示读不到目录，其余功能仍可用
 
 ## 许可
 

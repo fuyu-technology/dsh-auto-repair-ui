@@ -199,6 +199,20 @@ window.__ModuleLoader__.load({
 .ar-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; color: var(--dsw-alias-label-primary, inherit); }
 .ar-check input { margin: 0; cursor: pointer; }
 .ar-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ar-select {
+  border: 1px solid var(--dsw-alias-border-l2, #ffffff1f);
+  background: var(--dsw-alias-bg-layer-2, #ffffff0d);
+  color: var(--dsw-alias-label-primary, inherit);
+  border-radius: 8px; padding: 5px 8px; font-size: 12px; font-family: inherit;
+  min-width: 200px; max-width: 100%;
+}
+.ar-select:disabled { opacity: .5; }
+.ar-warnbox {
+  margin-top: 9px; padding: 8px 10px; border-radius: 7px; font-size: 12px;
+  border: 1px solid var(--ar-warn); color: var(--ar-warn);
+  background: var(--dsw-alias-bg-layer-1, #ffffff06);
+  white-space: pre-wrap; word-break: break-word; line-height: 1.6;
+}
 
 /* ── 每条错误的操作按钮 ───────────────────────────────────────────────── */
 .ar-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
@@ -256,6 +270,8 @@ window.__ModuleLoader__.load({
       const [err, setErr] = useState('')
       const [busyCode, setBusyCode] = useState('')
       const [policyBusy, setPolicyBusy] = useState(false)
+      const [models, setModels] = useState(null)
+      const [modelBusy, setModelBusy] = useState(false)
       const timerRef = useRef(null)
 
       const load = useCallback(async (silent) => {
@@ -276,6 +292,18 @@ window.__ModuleLoader__.load({
         timerRef.current = setInterval(() => load(true), 10000)
         return () => { if (timerRef.current) clearInterval(timerRef.current) }
       }, [load])
+
+      /** 读「让 AI 修」可用的模型/提供方（DSH 实时目录 + 内置兜底） */
+      const loadModels = useCallback(async () => {
+        try {
+          const r = await fetchJson('/models', { cache: 'no-store' })
+          setModels(r)
+        } catch (e) {
+          setModels({ ok: false, error: e?.message || String(e), providers: [], warnings: [] })
+        }
+      }, [])
+
+      useEffect(() => { loadModels() }, [loadModels])
 
       const doRepair = useCallback(async () => {
         setBusy(true)
@@ -321,6 +349,25 @@ window.__ModuleLoader__.load({
         }
       }, [postJson, load])
 
+      /** 选「让 AI 修」用哪个模型/提供方（只存 provider/model，不碰任何 Key） */
+      const setModel = useCallback(async (provider, model) => {
+        setModelBusy(true)
+        setToast(null)
+        try {
+          const r = await postJson('/models', { provider, model })
+          if (r && r.ok) {
+            setToast({ ok: true, text: `已切换到 ${provider} / ${model}，下一次「让 AI 修」就用它` })
+          } else {
+            setToast({ ok: false, text: r?.error || '切换模型失败' })
+          }
+          await loadModels()
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setModelBusy(false)
+        }
+      }, [postJson, loadModels])
+
       /** 修某一条（= 审批通过这一条） */
       const repairOne = useCallback(async (code) => {
         setBusyCode(code)
@@ -362,11 +409,13 @@ window.__ModuleLoader__.load({
         setBusyCode(code)
         setToast(null)
         try {
+          const cur = models?.current
+          const label = cur ? `${cur.provider} / ${cur.model}` : ''
           const r = await postJson('/agent-assist', { code })
           setToast({
             ok: r?.ok !== false,
             text: r?.ok
-              ? `已拉起 AI 协助处理 ${code}（它在后台跑，完成后这里会显示它的总结）`
+              ? `已拉起 AI 协助处理 ${code}${label ? `（模型 ${label}）` : ''}（它在后台跑，完成后这里会显示它的总结）`
               : String(r?.error || '拉起 AI 失败')
           })
           await load(true)
@@ -375,7 +424,7 @@ window.__ModuleLoader__.load({
         } finally {
           setBusyCode('')
         }
-      }, [postJson, load])
+      }, [postJson, load, models])
 
       /** 忽略 / 取消忽略某一条 */
       const toggleIgnore = useCallback(async (code, ignored) => {
@@ -414,7 +463,7 @@ window.__ModuleLoader__.load({
       const health = d.health || 'ok'
       const counts = d.counts || { fatal: 0, warn: 0, info: 0, total: 0 }
       const daemon = d.daemon || {}
-      const policy = d.policy || { mode: 'manual', agentAssist: true, rejectedCodes: [] }
+      const policy = d.policy || { mode: 'manual', agentAssist: true, autoFeed: true, rejectedCodes: [] }
       const rejectAll = policy.mode === 'reject-all'
       const healthText = health === 'fatal' ? '发现严重故障' : health === 'warn' ? '有可修复项' : '一切正常'
       const healthClass = health === 'fatal' ? 'fatal' : health === 'warn' ? 'warn' : 'ok'
@@ -423,6 +472,19 @@ window.__ModuleLoader__.load({
         : policy.mode === 'approve-all'
           ? '全部自动：守护进程发现能修的直接修，不用等你点。'
           : '逐条审批：守护进程只报告不改，等你点某一条的「修复」才动手。'
+
+      // 模型卡片用的数据（/models 拉不到时也要能把面板画出来）
+      const modelProviders = Array.isArray(models?.providers) ? models.providers : []
+      const modelWarnings = Array.isArray(models?.warnings) ? models.warnings : []
+      const modelError = models && models.ok === false ? String(models.error || '读不到模型列表') : ''
+      const curModel = models?.current || null
+      const curValue = curModel ? `${curModel.provider}::${curModel.model}` : ''
+      const curInList = !!curModel && modelProviders.some(
+        (g) => g.id === curModel.provider && (g.models || []).some((m) => m.id === curModel.model)
+      )
+      const modelHint = curModel
+        ? `${curModel.explicit ? '已指定' : '跟随 DSH 默认'}：${curModel.provider} / ${curModel.model}`
+        : '还没有选择，下一次「让 AI 修」会用 DSH 的默认模型'
 
       return h('div', { className: 'ar-root' },
         h('style', null, STYLE),
@@ -508,11 +570,67 @@ window.__ModuleLoader__.load({
               }),
               '修不了的时候让 AI 接手'
             ),
+            h('label', { className: 'ar-check', title: '开启后，插件修不动的报错会自动送进模型会话；同一报错 30 分钟内只送一次' },
+              h('input', {
+                type: 'checkbox',
+                checked: policy.autoFeed !== false,
+                disabled: policyBusy || rejectAll || policy.agentAssist === false,
+                onChange: (e) => setPolicy({ autoFeed: !!e.target.checked })
+              }),
+              '出错自动投喂给 AI'
+            ),
             h('button', {
               className: 'ar-btn', disabled: busy || rejectAll,
               onClick: repairAll
             }, busy ? '修复中…' : '全部修复')
           )
+        ),
+
+        // ── AI 模型（「让 AI 修」用哪个提供方/模型） ──────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, 'AI 模型'),
+            h('span', { className: 'ar-policy-hint' },
+              '「让 AI 修」时用哪个提供方/模型。选项来自 DSH 实际可用的模型目录；缺 Key 或路由未启用会直接标出来。')
+          ),
+          h('div', { className: 'ar-row' },
+            h('select', {
+              className: 'ar-select',
+              disabled: modelBusy,
+              value: curValue,
+              onChange: (e) => {
+                const v = String(e.target.value || '')
+                const i = v.indexOf('::')
+                if (i < 0) return
+                setModel(v.slice(0, i), v.slice(i + 2))
+              }
+            },
+              curValue ? null : h('option', { value: '' }, modelError ? '（读不到模型列表）' : '（跟随 DSH 默认）'),
+              curModel && !curInList
+                ? h('option', { value: curValue }, `${curModel.provider} / ${curModel.model}（当前，但目录里没看到）`)
+                : null,
+              modelProviders.map((g) => h('optgroup', { key: g.id, label: g.name || g.id },
+                (g.models || []).map((m) => h('option', {
+                  key: `${g.id}::${m.id}`,
+                  value: `${g.id}::${m.id}`
+                },
+                  `${m.name || m.id}${g.keyEnv
+                    ? (g.keyConfigured === false ? '（缺 Key）' : g.keyConfigured === true ? '（Key 已配）' : '')
+                    : ''}${g.available === false ? '（未启用）' : ''}`
+                ))
+              ))
+            ),
+            h('button', {
+              className: 'ar-btn', disabled: modelBusy,
+              onClick: () => loadModels()
+            }, modelBusy ? '处理中…' : '刷新模型')
+          ),
+          h('div', { className: 'ar-policy-hint', style: { marginTop: '8px' } }, modelHint),
+          models?.readiness && models.readiness.ok === false
+            ? h('div', { className: 'ar-warnbox' }, `当前模型暂不可用：${models.readiness.reason}`)
+            : null,
+          modelError ? h('div', { className: 'ar-warnbox' }, modelError) : null,
+          modelWarnings.length ? h('div', { className: 'ar-warnbox' }, modelWarnings.join('\n')) : null
         ),
 
         // 当前诊断结论
@@ -528,7 +646,13 @@ window.__ModuleLoader__.load({
                   f.title,
                   f.rejected ? h('span', { className: 'ar-flag rejected' }, '已忽略') : null,
                   f.fixable ? null : h('span', { className: 'ar-flag' }, '不能自动修'),
-                  handoff && handoff.status === 'queued' ? h('span', { className: 'ar-flag agent' }, 'AI 处理中') : null
+                  handoff && handoff.status === 'queued' ? h('span', { className: 'ar-flag agent' }, 'AI 处理中') : null,
+                  // 这一次走的是哪条路：插件修好的 / 升级给模型的
+                  f.route === 'plugin' ? h('span', { className: 'ar-flag', title: f.routeDetail || '' }, '插件已修复') : null,
+                  f.route === 'model'
+                    ? h('span', { className: 'ar-flag agent', title: f.routeDetail || '' },
+                        `已升级给模型${handoff?.model ? `（${handoff.model}）` : ''}`)
+                    : null
                 ),
                 h('div', { className: 'ar-finding-detail' }, f.detail || ''),
                 h('div', { className: 'ar-actions' },
@@ -589,6 +713,13 @@ window.__ModuleLoader__.load({
           h('br'),
           '逐条审批模式下，守护进程只诊断不修；「让 AI 修」会拉起一个带本地工具的 DSH 会话，',
           '由它自己复核问题、动手改、然后把总结写回这里。',
+          h('br'),
+          '阶梯是「先插件、后模型」：能用内置修复器修的直接修（标「插件已修复」），修不动才升级给模型，',
+          '并把报错自动投喂进那个会话的输入框（标「已升级给模型」）。同一报错 30 分钟内只投喂一次；',
+          '缺 Key、路由未启用这类配置问题只提示、不投喂。',
+          h('br'),
+          '「AI 模型」卡片决定下一次「让 AI 修」用哪个模型；MiniMax 的 Key 由 DSH 凭据系统管理，',
+          '面板本身不存密钥。',
           h('br'),
           '手动诊断：',
           h('code', null, 'node D:\\大肥鱼\\auto-repair\\auto-repair.mjs --check')

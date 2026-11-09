@@ -1,3 +1,26 @@
 - insert:
     - id: dsh-auto-repair-ui
       name: 'dsh-auto-repair-ui'
+
+# ── MiniMax 模型路由（bundle 层）────────────────────────────────────────────
+# 面板「AI 模型」里的 minimax / minimax-cn 选项由这段注册。
+# 用 DSH 自带的 @deepseek-ai/dsh-llm-pi-ai（安装目录里已有），不新增第三方依赖；
+# 模型目录/协议都从安装目录继承，这里只声明路由和「按名引用」的凭据。
+#
+# ⚠ 为什么写在 bundle 层：DSH 保存设置时会重写 profile 的 cordis.patch.yml，
+#   并抹掉它不管理的行（见 auto-repair/README.md「QQ 桥接掉了」的根因）。
+#   bundle 层只在启动时读取、永不被写回，所以注册放这里最稳。
+#
+# Key 不在本文件里：填在 DSH 设置里配置凭据 MINIMAX_API_KEY / MINIMAX_CN_API_KEY，
+# 或写进 ~/.dsh/.credentials.yaml 的 refs: 下，或使用同名环境变量。
+- insert:
+    - id: llm-pi-ai
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers:
+          minimax:
+            apiKeyEnv: MINIMAX_API_KEY
+            displayName: MiniMax
+          minimax-cn:
+            apiKeyEnv: MINIMAX_CN_API_KEY
+            displayName: MiniMax 中国站
