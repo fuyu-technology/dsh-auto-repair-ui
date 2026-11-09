@@ -220,10 +220,15 @@ export async function listModels({ timeoutMs = 8000 } = {}) {
   }
 
   const explicit = readChoice()
+  // current 永远给出「实际会用哪个」（explicit 优先，否则 DSH 默认），
+  // 供 readiness / 守护进程判断；selected 只在用户真的选过时才有值，
+  // 面板据此决定下拉框要不要停在「跟随 DSH 默认」上。
   const current = explicit || dshDefault || { provider: 'deepseek-account', model: 'deepseek-flash' }
   return {
     ok: true,
     current: { ...current, explicit: !!explicit },
+    selected: explicit ? { provider: explicit.provider, model: explicit.model } : null,
+    dshDefault: dshDefault || null,
     providers,
     catalogError,
     failures

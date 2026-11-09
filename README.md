@@ -18,6 +18,23 @@ DeepSeek Harness 插件：把「自愈守护进程」搬进 DSH 设置页。装�
 - **AI 模型选择**：面板上直接选「让 AI 修」用哪个提供方/模型，已接入 MiniMax（v1.2.0）
 - **自动投喂报错**：插件修不动的报错，自动送进选中模型的会话输入框；可关（v1.3.0）
 - **路径可见**：每条问题标出「插件已修复」还是「已升级给模型」，不用猜（v1.3.0）
+- **客户端发现**：扫描本机 TRAE / MiniMax 客户端，可选手动改路径与「关联启动」（v1.4.0）
+
+## 本机模型客户端（v1.4.0）
+
+面板新增「本机模型客户端」卡片：
+
+| 能力 | 说明 |
+|---|---|
+| 自动扫描 | 注册表 Uninstall 项、开始菜单快捷方式、常见安装目录（Program Files / LocalAppData / Roaming），匹配 TRAE 与 MiniMax |
+| 如实呈现 | 每项显示客户端名 + 实际 `.exe` 路径 + 「已安装 / 未检测到」；扫不到就写未检测到，不编路径 |
+| 手动改路径 | 扫描错了或扫不到时可手填 `.exe` 完整路径，保存即校验（存在且是 `.exe`），立即生效；可「恢复自动」清掉手动值 |
+| 关联启动 | 每项一个开关，默认关。勾上后，用该模型投喂报错前会先拉起对应客户端；不勾则与旧行为完全一致 |
+
+设置存在 `<REPAIR_DIR>/state/clients.json`（只有路径和布尔开关，不含任何密钥），重启后保持。
+
+provider 与客户端的映射：`minimax` / `minimax-cn` → MiniMax 客户端。`deepseek-account` 暂不映射（归属待定），
+所以选它时不会额外拉起任何客户端。
 
 ## 自动投喂报错
 
@@ -168,6 +185,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | 模型选择文件 | `<REPAIR_DIR>/state/model-choice.json`（只存 provider/model；不存在时跟随 DSH 默认） |
 | 投喂去重账本 | `<REPAIR_DIR>/state/feed-state.json` |
 | 路径记录 | `<REPAIR_DIR>/state/repair-outcomes.json`（插件修好的 / 升级给模型的） |
+| 客户端设置 | `<REPAIR_DIR>/state/clients.json`（手动路径覆盖 + 关联启动开关） |
 
 没有守护进程时，面板会显示「守护进程不在」——这是正常的，不是面板坏了。
 
@@ -206,6 +224,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | GET | `/dsh-auto-repair/history` | 修复历史与频次计数 |
 | GET / POST / PUT | `/dsh-auto-repair/policy` | 读 / 写审批策略（`mode`、`agentAssist`、`autoFeed`） |
 | GET / POST | `/dsh-auto-repair/models` | 读模型目录 / 切换「让 AI 修」用的模型（body: `provider`、`model`） |
+| GET / POST | `/dsh-auto-repair/clients` | 扫描本机客户端 / 改路径或开关（body: `id`、`path`、`launch`） |
 | POST | `/dsh-auto-repair/repair-one` | 修指定的单条（body: `code`） |
 | POST | `/dsh-auto-repair/repair-all` | 修补所有可修项 |
 | POST | `/dsh-auto-repair/agent-assist` | 把某条交给 AI（body: `code`） |
@@ -213,8 +232,10 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 
 ## 版本与兼容性
 
-当前版本 **1.3.0**。
+当前版本 **1.4.0**。
 
+- 1.4.0 新增：本机模型客户端自动扫描（注册表 / 开始菜单 / 常见目录）、手动路径覆盖、
+  按客户端配置的「关联启动」开关；模型下拉默认停在「跟随 DSH 默认」，不再默认选中 deepseek
 - 1.3.0 新增：`autoFeed` 自动投喂开关（默认开）、报错特征哈希 + 30 分钟去重、
   提示词 3000 字硬截断与 `【自动投喂·自愈面板】` 标记、配置类问题（缺 Key / 路由未启用）
   只提示不投喂，以及面板上的「插件已修复 / 已升级给模型」路径标记

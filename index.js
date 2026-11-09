@@ -46,6 +46,7 @@ const REPAIR_ALL_PATH = `${API_BASE}/repair-all`
 const AGENT_PATH = `${API_BASE}/agent-assist`
 const IGNORE_PATH = `${API_BASE}/ignore`
 const MODELS_PATH = `${API_BASE}/models`
+const CLIENTS_PATH = `${API_BASE}/clients`
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // auto-repair 守护进程的实际位置。
@@ -427,6 +428,19 @@ function apply(ctx) {
     return { ...base, warnings: [...new Set(warnings)], readiness }
   }
 
+  /**
+   * 扫本机装了哪些模型客户端（TRAE / MiniMax）。
+   * 扫不到就如实返回空/未安装，不编路径；扫描失败也只降级成一条错误提示。
+   */
+  async function collectClients() {
+    const r = await runCli(['--scan-clients'], 40000)
+    const base = r.json
+    if (!base || base.ok === false || !Array.isArray(base.clients)) {
+      return { ok: false, error: base?.error || r.error || r.stderr || '扫描客户端失败', clients: [] }
+    }
+    return base
+  }
+
   disposers.push(webServer.register({
     kind: 'exact',
     path: STATUS_PATH,
@@ -602,6 +616,45 @@ function apply(ctx) {
     }
   }))
 
+  // ── 本机模型客户端：扫描 / 改路径 / 关联启动开关 ──────────────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: CLIENTS_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        try {
+          sendJson(res, 200, await collectClients())
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: e?.message || String(e), clients: [] })
+        }
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        const id = String(body.id || '').trim()
+        if (!id) {
+          sendJson(res, 400, { ok: false, error: '缺少客户端 id' })
+          return
+        }
+        const patch = { id }
+        // path 传空字符串 = 清掉手动路径，回到自动扫描
+        if (body.path !== undefined) patch.path = String(body.path || '')
+        if (body.launch !== undefined) patch.launch = body.launch === true
+        const r = await runCli(['--set-client', JSON.stringify(patch)], 30000)
+        const json = r.json
+        if (!json?.ok) {
+          sendJson(res, 200, { ok: false, error: json?.error || r.error || r.stderr || '保存失败' })
+          return
+        }
+        // 改完立刻回一份最新的扫描结果，前端不用再请求一次
+        sendJson(res, 200, { ...json, ...(await collectClients()) })
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
   // ── 忽略 / 取消忽略某一条 ─────────────────────────────────────────────────
   disposers.push(webServer.register({
     kind: 'exact',
@@ -630,7 +683,7 @@ function apply(ctx) {
   }
   if (typeof ctx?.effect === 'function') ctx.effect(() => dispose, `${NS}: api routes`)
   try {
-    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${MODELS_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
+    ctx?.logger?.info?.(`[${NS}] API 路由就绪: ${STATUS_PATH}, ${DIAGNOSE_PATH}, ${REPAIR_PATH}, ${HISTORY_PATH}, ${POLICY_PATH}, ${MODELS_PATH}, ${CLIENTS_PATH}, ${REPAIR_ONE_PATH}, ${REPAIR_ALL_PATH}, ${AGENT_PATH}, ${IGNORE_PATH}`)
   } catch {}
   return dispose
 }

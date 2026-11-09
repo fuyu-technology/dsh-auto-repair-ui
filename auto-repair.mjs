@@ -33,6 +33,8 @@
 //   node auto-repair.mjs --models       # 列出可选的 AI 模型/提供方 + 当前选择
 //   node auto-repair.mjs --get-model    # 输出当前选择的模型
 //   node auto-repair.mjs --set-model '{"provider":"minimax","model":"MiniMax-M3"}'
+//   node auto-repair.mjs --scan-clients # 扫本机装了哪些模型客户端（TRAE / MiniMax）
+//   node auto-repair.mjs --set-client '{"id":"trae","path":"D:\\...\\Trae CN.exe","launch":true}'
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -44,6 +46,7 @@ import { notify } from './notify.mjs'
 import { readPolicy, writePolicy, canAutoRepair, isRejected, MODES } from './policy.mjs'
 import { readHandoffs, writeHandoff, feedHashOf, shouldFeed, markFed } from './agent-repair.mjs'
 import { listModels, readChoice, writeChoice, findModel, readinessOf } from './models.mjs'
+import { scanClients, setClient } from './clients.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const STATE = path.join(HERE, 'state')
@@ -69,7 +72,7 @@ const argOf = (name, fallback = '') => {
 // 所以那时日志只落文件，不写 stdout。
 const JSON_ONLY = ARGS.some((a) =>
   ['--check', '--repair', '--repair-all', '--agent', '--get-policy', '--set-policy',
-    '--models', '--get-model', '--set-model'].includes(a)
+    '--models', '--get-model', '--set-model', '--scan-clients', '--set-client'].includes(a)
 )
 const QUIET_STDOUT = JSON_ONLY
 
@@ -563,6 +566,28 @@ if (ARGS.includes('--set-model')) {
   }
   const current = writeChoice({ provider, model })
   console.log(JSON.stringify({ ok: true, current }))
+  process.exit(0)
+}
+
+// 客户端发现：扫本机装了哪些模型客户端（TRAE / MiniMax）
+if (ARGS.includes('--scan-clients')) {
+  const r = await scanClients()
+  console.log(JSON.stringify(r))
+  process.exit(0)
+}
+
+// 客户端设置：改路径（path）和/或「关联启动」开关（launch）
+if (ARGS.includes('--set-client')) {
+  const raw = argOf('--set-client')
+  let req = {}
+  try { req = JSON.parse(raw || '{}') } catch { req = {} }
+  const id = String(req.id || '').trim()
+  if (!id) {
+    console.log(JSON.stringify({ ok: false, error: '需要 id（trae / minimax）' }))
+    process.exit(0)
+  }
+  const r = setClient(id, { path: req.path, launch: req.launch })
+  console.log(JSON.stringify(r))
   process.exit(0)
 }
 

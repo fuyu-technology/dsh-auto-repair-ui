@@ -26,6 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { diagnoseAll, SEVERITY, ROOT } from './diagnose.mjs'
 import { FIXERS, NEEDS_HUMAN } from './repair.mjs'
 import { readChoice } from './models.mjs'
+import { launchClientForProvider } from './clients.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // 交接记录目录。同样支持 REPAIR_STATE_DIR 覆盖（测试用）。
@@ -246,6 +247,23 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
     }
   }
 
+  // 可选关联启动：用户勾了「关联启动」的客户端，才在投喂前把它拉起来。
+  // 默认全关 → 行为与以前完全一致；缺客户端/没勾/路径失效都只是记一笔，不阻断投喂。
+  let launchedClient = null
+  if (choice) {
+    try {
+      const lr = await launchClientForProvider(choice.provider)
+      if (lr?.ok) {
+        launchedClient = { client: lr.client, path: lr.path, pid: lr.pid }
+        console.log(`[client] ${lr.reason} → ${lr.path}`)
+      } else if (!lr?.skipped) {
+        console.log(`[client] 未拉起：${lr?.reason || '未知原因'}`)
+      }
+    } catch (e) {
+      console.log(`[client] 拉起异常（已忽略）：${e?.message || e}`)
+    }
+  }
+
   const prompt = buildAgentPrompt(findings, { note, auto })
   const accepted = await api.sessions.prompt({
     sessionId,
@@ -280,6 +298,7 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
     baseUrl,
     model: appliedModel,
     provider: choice?.provider || null,
+    client: launchedClient,
     auto
   }
 }

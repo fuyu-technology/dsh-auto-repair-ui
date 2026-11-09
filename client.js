@@ -207,6 +207,29 @@ window.__ModuleLoader__.load({
   min-width: 200px; max-width: 100%;
 }
 .ar-select:disabled { opacity: .5; }
+/* 客户端路径输入：与下拉框同款令牌，不引入新控件风格 */
+.ar-input {
+  border: 1px solid var(--dsw-alias-border-l2, #ffffff1f);
+  background: var(--dsw-alias-bg-layer-2, #ffffff0d);
+  color: var(--dsw-alias-label-primary, inherit);
+  border-radius: 8px; padding: 5px 8px; font-size: 12px; font-family: inherit;
+  flex: 1 1 320px; min-width: 200px; max-width: 100%;
+}
+.ar-input:disabled { opacity: .5; }
+.ar-client-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.ar-client-row {
+  padding: 9px 10px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, #ffffff1f);
+  background: var(--dsw-alias-bg-layer-1, #ffffff06);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.ar-client-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ar-client-name { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-primary, inherit); }
+.ar-client-path {
+  font-size: 11px; font-family: ui-monospace, Consolas, monospace;
+  color: var(--dsw-alias-label-secondary, #ffffffa6);
+  word-break: break-all; line-height: 1.5;
+}
 .ar-warnbox {
   margin-top: 9px; padding: 8px 10px; border-radius: 7px; font-size: 12px;
   border: 1px solid var(--ar-warn); color: var(--ar-warn);
@@ -272,6 +295,10 @@ window.__ModuleLoader__.load({
       const [policyBusy, setPolicyBusy] = useState(false)
       const [models, setModels] = useState(null)
       const [modelBusy, setModelBusy] = useState(false)
+      // 本机模型客户端（TRAE / MiniMax）：扫描结果 + 手动改路径时的草稿
+      const [clients, setClients] = useState(null)
+      const [clientsBusy, setClientsBusy] = useState(false)
+      const [clientDraft, setClientDraft] = useState({})
       const timerRef = useRef(null)
 
       const load = useCallback(async (silent) => {
@@ -304,6 +331,44 @@ window.__ModuleLoader__.load({
       }, [])
 
       useEffect(() => { loadModels() }, [loadModels])
+
+      /** 扫本机装了哪些模型客户端（扫不到就如实是「未检测到」） */
+      const loadClients = useCallback(async (silent) => {
+        if (!silent) setClientsBusy(true)
+        try {
+          const r = await fetchJson('/clients', { cache: 'no-store' })
+          setClients(r)
+          setClientDraft({})
+        } catch (e) {
+          setClients({ ok: false, error: e?.message || String(e), clients: [] })
+        } finally {
+          if (!silent) setClientsBusy(false)
+        }
+      }, [])
+
+      useEffect(() => { loadClients() }, [loadClients])
+
+      /** 改客户端路径 / 关联启动开关（改完用返回的新扫描结果直接覆盖，省一次请求） */
+      const updateClient = useCallback(async (id, patch) => {
+        setClientsBusy(true)
+        try {
+          const r = await postJson('/clients', { id, ...patch })
+          if (r?.ok === false) {
+            setToast({ ok: false, text: String(r.error || '保存失败') })
+          } else {
+            setClients(r)
+            setClientDraft({})
+            const name = (r?.clients || []).find((c) => c.id === id)?.name || id
+            setToast({ ok: true, text: patch.launch !== undefined
+              ? `${name}：关联启动已${patch.launch ? '打开' : '关闭'}`
+              : `${name}：路径已更新` })
+          }
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setClientsBusy(false)
+        }
+      }, [])
 
       const doRepair = useCallback(async () => {
         setBusy(true)
@@ -478,13 +543,18 @@ window.__ModuleLoader__.load({
       const modelWarnings = Array.isArray(models?.warnings) ? models.warnings : []
       const modelError = models && models.ok === false ? String(models.error || '读不到模型列表') : ''
       const curModel = models?.current || null
-      const curValue = curModel ? `${curModel.provider}::${curModel.model}` : ''
-      const curInList = !!curModel && modelProviders.some(
-        (g) => g.id === curModel.provider && (g.models || []).some((m) => m.id === curModel.model)
+      // selected 只在用户真的选过时才有值：没选过就停在「跟随 DSH 默认」，
+      // 不再默认把 deepseek 那一项顶上去。
+      const selected = models?.selected || null
+      const curValue = selected ? `${selected.provider}::${selected.model}` : ''
+      const curInList = !!selected && modelProviders.some(
+        (g) => g.id === selected.provider && (g.models || []).some((m) => m.id === selected.model)
       )
-      const modelHint = curModel
-        ? `${curModel.explicit ? '已指定' : '跟随 DSH 默认'}：${curModel.provider} / ${curModel.model}`
-        : '还没有选择，下一次「让 AI 修」会用 DSH 的默认模型'
+      const modelHint = selected
+        ? `已指定：${selected.provider} / ${selected.model}`
+        : curModel
+          ? `未指定，跟随 DSH 默认：${curModel.provider} / ${curModel.model}`
+          : '还没有选择，下一次「让 AI 修」会用 DSH 的默认模型'
 
       return h('div', { className: 'ar-root' },
         h('style', null, STYLE),
@@ -633,6 +703,75 @@ window.__ModuleLoader__.load({
           modelWarnings.length ? h('div', { className: 'ar-warnbox' }, modelWarnings.join('\n')) : null
         ),
 
+        // ── 本机模型客户端（扫描 + 可选关联启动） ──────────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, '本机模型客户端'),
+            h('span', { className: 'ar-policy-hint' },
+              '自动扫描本机装了的模型客户端（注册表 / 开始菜单 / 常见安装目录）。勾上「关联启动」后，用该模型投喂报错时会先把客户端拉起来。')
+          ),
+          clients?.ok === false
+            ? h('div', { className: 'ar-warnbox' }, `扫描失败：${clients.error || '未知原因'}`)
+            : null,
+          h('div', { className: 'ar-client-list' },
+            (clients?.clients || []).map((c) => {
+              const draft = clientDraft[c.id]
+              const shown = draft !== undefined ? draft : (c.manualPath || c.path || '')
+              return h('div', { key: c.id, className: 'ar-client-row' },
+                h('div', { className: 'ar-client-head' },
+                  h('span', { className: 'ar-client-name' }, c.name),
+                  h('span', { className: `ar-flag${c.installed ? ' agent' : ''}` }, c.installed ? '已安装' : '未检测到'),
+                  c.source === 'manual' ? h('span', { className: 'ar-flag' }, '手动指定') : null,
+                  h('span', { className: 'ar-policy-hint' }, c.hint || '')
+                ),
+                h('div', { className: 'ar-client-path' }, c.path || '未检测到可执行文件'),
+                h('div', { className: 'ar-row' },
+                  h('input', {
+                    className: 'ar-input',
+                    type: 'text',
+                    placeholder: '扫描不到时，把 .exe 完整路径贴这里',
+                    value: shown,
+                    spellCheck: false,
+                    onChange: (e) => setClientDraft((prev) => ({ ...prev, [c.id]: e.target.value }))
+                  }),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: clientsBusy || shown === (c.path || ''),
+                    onClick: () => updateClient(c.id, { path: shown.trim() })
+                  }, '保存路径'),
+                  c.manualPath
+                    ? h('button', {
+                        className: 'ar-btn', disabled: clientsBusy,
+                        onClick: () => updateClient(c.id, { path: '' })
+                      }, '恢复自动')
+                    : null,
+                  h('label', { className: 'ar-check' },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: c.launch === true,
+                      disabled: clientsBusy || !c.installed,
+                      onChange: (e) => updateClient(c.id, { launch: !!e.target.checked })
+                    }),
+                    '关联启动'
+                  )
+                ),
+                c.installed && !c.launch
+                  ? h('div', { className: 'ar-policy-hint' }, '未勾选「关联启动」：投喂时不会拉起它，保持原有行为。')
+                  : null
+              )
+            })
+          ),
+          h('div', { className: 'ar-row', style: { marginTop: '8px' } },
+            h('button', {
+              className: 'ar-btn', disabled: clientsBusy,
+              onClick: () => loadClients()
+            }, clientsBusy ? '扫描中…' : '重新扫描')
+          ),
+          clients && (clients.clients || []).length === 0
+            ? h('div', { className: 'ar-policy-hint' }, '没有检测到任何模型客户端；这不影响自愈功能，只是投喂时不会额外拉起客户端。')
+            : null
+        ),
+
         // 当前诊断结论
         h('div', { className: 'ar-section-title' }, '当前诊断'),
         (d.findings || []).length
@@ -720,6 +859,9 @@ window.__ModuleLoader__.load({
           h('br'),
           '「AI 模型」卡片决定下一次「让 AI 修」用哪个模型；MiniMax 的 Key 由 DSH 凭据系统管理，',
           '面板本身不存密钥。',
+          h('br'),
+          '「本机模型客户端」卡片只做发现与可选关联启动：勾了「关联启动」才会在投喂前拉起对应客户端，',
+          '默认全关；扫不到就显示「未检测到」，也可以手填 .exe 完整路径。',
           h('br'),
           '手动诊断：',
           h('code', null, 'node D:\\大肥鱼\\auto-repair\\auto-repair.mjs --check')
