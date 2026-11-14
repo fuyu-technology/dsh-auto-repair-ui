@@ -861,35 +861,14 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ar-policy-head' },
             h('span', { className: 'ar-policy-title' }, '修复使用的模型'),
             h('span', { className: 'ar-policy-hint' },
-              '「让 AI 修」时用哪个提供方/模型（只影响修复用途，不会改队列默认和全天回复）。选项来自 DSH 实际可用的模型目录；缺 Key 或路由未启用会直接标出来。')
+              '跟随运行通道（DSH / API 二选一），不再单独指定；要换模型请在上方「运行通道」切换。')
           ),
           h('div', { className: 'ar-row' },
-            h('select', {
-              className: 'ar-select',
-              disabled: modelBusy,
-              value: curValue,
-              onChange: (e) => {
-                const v = String(e.target.value || '')
-                const i = v.indexOf('::')
-                if (i < 0) return
-                setModel(v.slice(0, i), v.slice(i + 2))
-              }
-            },
-              curValue ? null : h('option', { value: '' }, modelError ? '（读不到模型列表）' : '（跟随 DSH 默认）'),
-              curModel && !curInList
-                ? h('option', { value: curValue }, `${curModel.provider} / ${curModel.model}（当前，但目录里没看到）`)
-                : null,
-              modelProviders.map((g) => h('optgroup', { key: g.id, label: g.name || g.id },
-                (g.models || []).map((m) => h('option', {
-                  key: `${g.id}::${m.id}`,
-                  value: `${g.id}::${m.id}`
-                },
-                  `${m.name || m.id}${g.keyEnv
-                    ? (g.keyConfigured === false ? '（缺 Key）' : g.keyConfigured === true ? '（Key 已配）' : '')
-                    : ''}${g.available === false ? '（未启用）' : ''}`
-                ))
-              ))
-            ),
+            h('span', { className: 'ar-sub', style: { minWidth: '240px' } },
+              curModel
+                ? `${curModel.provider} / ${curModel.model}`
+                : (modelError ? '（读不到模型列表）' : '跟随运行通道')),
+            h('span', { className: 'ar-sub' }, '三用途同步，不可单独修改'),
             h('button', {
               className: 'ar-btn', disabled: modelBusy,
               onClick: () => loadModels()
@@ -1258,13 +1237,15 @@ window.__ModuleLoader__.load({
       const [cBase, setCBase] = useState('')
       const [cModels, setCModels] = useState('')
       const [cKey, setCKey] = useState('')
-      // 三用途的指定请求各自独立忙态，互不影响
-      const [busyUse, setBusyUse] = useState('')
+      // 三用途始终跟随运行通道，不再单独指定
       // 每个厂商卡片的模型列表是否展开（默认全收起，状态在本次会话内保持）
       const [openModels, setOpenModels] = useState(() => ({ ...VN_OPEN }))
       // 发送频率：开关 / 每分钟上限（null = 输入框显示当前已保存值，不显示未提交的草稿）
       const [sendRateBusy, setSendRateBusy] = useState(false)
       const [sendRateDraft, setSendRateDraft] = useState(null)
+      // 上下文节省：滑块 0–100（0 最省，100 质量优先）+ 自定义数值
+      const [contextSavingBusy, setContextSavingBusy] = useState(false)
+      const [contextLevelDraft, setContextLevelDraft] = useState(null)
 
       const load = useCallback(async () => {
         try {
@@ -1352,6 +1333,50 @@ window.__ModuleLoader__.load({
         updateSendRate({ perMinute: n })
       }
 
+      /** 上下文节省：三档预设 / 滑块 / 自定义数值，写入后桥接热读生效。 */
+      async function updateContextSaving(patch, note) {
+        setContextSavingBusy(true)
+        setErr('')
+        setNote('')
+        try {
+          const r = await fetchJson('/context-saving', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(patch)
+          })
+          if (r && r.ok === false) setErr(String(r.error || '保存上下文节省失败'))
+          else {
+            setNote(note || '上下文节省已更新，桥接立即生效')
+            setContextLevelDraft(null)
+            await load()
+          }
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setContextSavingBusy(false)
+        }
+      }
+
+      function saveContextLevel() {
+        if (contextLevelDraft === null) return
+        updateContextSaving({ level: contextLevelDraft }, `上下文节省已设为 ${contextLevelDraft}（0 最省 / 100 质量优先），桥接立即生效`)
+      }
+
+      function saveContextField(field, raw) {
+        const n = Math.round(Number(raw))
+        const limits = {
+          historyMessages: [2, 50, '历史条数'],
+          historyChars: [40, 600, '每条字数'],
+          toolResultChars: [200, 8000, '工具结果字数']
+        }
+        const [min, max, label] = limits[field]
+        if (!Number.isFinite(n) || n < min || n > max) {
+          setErr(`${label}必须在 ${min}–${max} 之间`)
+          return
+        }
+        updateContextSaving({ preset: 'custom', [field]: n }, `${label}已改为 ${n}，桥接立即生效`)
+      }
+
       /** 一键切换运行通道：API（智谱）↔ DSH（DeepSeek） */
       async function setRoute(route) {
         setBusy('route')
@@ -1410,38 +1435,6 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** 指定某个用途用哪个模型；value 为空 = 清空这个用途（修复不允许清空） */
-      async function assignUse(use, value) {
-        if (!value && use === 'repair') {
-          setErr('「修复」用途必须指定一个模型')
-          return
-        }
-        setBusyUse(use)
-        setNote('')
-        try {
-          const i = value.indexOf('::')
-          const body = value
-            ? { use, provider: value.slice(0, i), model: value.slice(i + 2) }
-            : { use, clearUse: true }
-          const r = await fetchJson('/models', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body)
-          })
-          if (r && r.ok === false) setErr(String(r.error || '指定失败'))
-          else {
-            setErr('')
-            const label = (MODEL_USE_LABELS.find((x) => x[0] === use) || ['', use])[1]
-            setNote(value ? `已把「${label}」指定为 ${value.replace('::', ' / ')}` : `已清空「${label}」的指定`)
-            await load()
-          }
-        } catch (e) {
-          setErr(e?.message || String(e))
-        } finally {
-          setBusyUse('')
-        }
-      }
-
       const vendorUses = (state && state.uses) || {}
       const enabledList = Array.isArray(state && state.enabled) ? state.enabled : []
       const enabledKeys = new Set(enabledList.map((x) => `${x.provider}::${x.model}`))
@@ -1455,8 +1448,11 @@ window.__ModuleLoader__.load({
       }
 
       const vendors = Array.isArray(state && state.vendors) ? state.vendors : []
-      // state 可能还没加载完（null）：运行通道只做展示，不能在渲染时直接解引用。
-      const routeMode = (state && state.route) || 'custom'
+      // 通道只有 dsh / api 两种；优先用后端 route，旧后端没有 route 时按三用途的实际模型推断。
+      const routeReplyUse = state && state.uses && state.uses.reply
+      const routeMode = (state && (state.route === 'api' || state.route === 'dsh'))
+        ? state.route
+        : (routeReplyUse && routeReplyUse.provider && routeReplyUse.provider !== 'deepseek-account' ? 'api' : 'dsh')
       // 运行通道按钮显示该通道实际选中的模型名：优先「全天回复」用途，其次队列默认 / 修复；
       // 都没指定时退回该通道的默认模型，避免出现空括号。
       const routeChannelModel = (route) => {
@@ -1496,10 +1492,31 @@ window.__ModuleLoader__.load({
         `统计更新：${srStats.updatedAt ? new Date(srStats.updatedAt).toLocaleTimeString('zh-CN') : '暂无数据（桥接启动后还没发过消息）'}`
       ].join('\n')
       const routeDetail = [
-        `当前通道：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : routeMode === 'api' ? 'API（智谱）' : '自定义'}`,
+        `当前通道：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）'}`,
+        '二选一：修复 / 队列默认 / 全天回复始终使用同一个通道的同一个模型，不能混用。',
         rateDetail
       ].join('\n')
       const replyDetail = ['用途：全天回复（自动回复用的模型）', rateDetail].join('\n')
+      // 上下文节省：设置来自 auto-repair/state/context-saving.json，桥接按 mtime 热读。
+      const contextSaving = (state && state.contextSaving) || {
+        preset: 'balanced', historyMessages: 15, historyChars: 200,
+        toolResultChars: 1200, wakeStatic: 'light', estimatedSavingPercent: 0
+      }
+      const contextLevel = contextLevelDraft !== null ? contextLevelDraft
+        : contextSaving.preset === 'saver' ? 20 : contextSaving.preset === 'quality' ? 90 : 55
+      const contextPresetLabel = contextSaving.preset === 'saver' ? '省'
+        : contextSaving.preset === 'quality' ? '质量优先'
+          : contextSaving.preset === 'custom' ? '自定义' : '均衡'
+      const wakeStaticLabel = contextSaving.wakeStatic === 'once' ? '仅首次注入'
+        : contextSaving.wakeStatic === 'full' ? '每次完整注入' : '每次精简注入'
+      const contextDetail = [
+        `当前档位：${contextPresetLabel}`,
+        `群上下文：最近 ${contextSaving.historyMessages} 条，每条最多 ${contextSaving.historyChars} 字`,
+        `工具结果：单条最多 ${contextSaving.toolResultChars} 字`,
+        `唤醒静态说明：${wakeStaticLabel}`,
+        `预计节省：约 ${contextSaving.estimatedSavingPercent}%（仅群上下文/工具结果/唤醒说明）`,
+        '人设与角色卡不参与裁剪；默认均衡，改完桥接下一条消息立即生效。'
+      ].join('\n')
       const models = vendors.reduce((n, v) => n + (v.models ? v.models.length : 0), 0)
       const counts = { ready: 0, nokey: 0, quota: 0, pending: 0 }
       for (const v of vendors) counts[vendorStatus(v)] += 1
@@ -1583,6 +1600,8 @@ window.__ModuleLoader__.load({
           .ar-tip-mark{font-size:10px;opacity:.6;border:1px solid rgba(127,127,127,.35);border-radius:999px;padding:0 5px}
           .sr-divider{height:1px;background:rgba(127,127,127,.18);margin:12px 0}
           .sr-num{width:84px;flex:0 0 auto;min-width:0;padding:4px 8px}
+          .cs-slider{flex:1 1 180px;min-width:140px;accent-color:#4084ff;cursor:pointer}
+          .cs-num{width:64px;flex:0 0 auto;min-width:0;padding:4px 6px}
         `),
 
         h('div', { className: 'ar-head' },
@@ -1632,11 +1651,11 @@ window.__ModuleLoader__.load({
                 'aria-label': '运行通道详情：状态、当前模型、最近一分钟实发、上限、是否限流排队'
               }, h('span', { className: 'ar-tip-mark' }, '详情'))
             ),
-            h('span', { className: 'ar-flag' }, routeMode === 'dsh' ? 'DSH（DeepSeek）' : routeMode === 'api' ? 'API（智谱）' : '自定义')
+            h('span', { className: 'ar-flag' }, routeMode === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）')
           ),
           h('div', { className: 'ar-policy-hint' },
-            '一键切换「修复 / 队列默认 / 全天回复」实际调用的通道；切换后下一条消息、下一条任务立即生效，不用改配置文件。',
-            'API（智谱）走智谱直连；DSH（DeepSeek）走 DSH 账号、无需 API Key。任务队列始终串行：一条完成后再取下一条。'
+            '二选一：选中一个通道后，「修复 / 队列默认 / 全天回复」三个用途会一起切换，不能混用。',
+            '切换后下一条消息、下一条任务立即生效，不用改配置文件；API（智谱）走智谱直连，DSH（DeepSeek）走 DSH 账号、无需 API Key。'
           ),
           h('div', { className: 'ar-row' },
             h('button', {
@@ -1650,9 +1669,7 @@ window.__ModuleLoader__.load({
               onClick: () => setRoute('dsh')
             }, routeLabels.dsh),
             h('span', { className: 'ar-sub' },
-              routeMode === 'custom'
-                ? '当前：自定义（下方单用途选择优先）'
-                : `当前：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）'}`)
+              `当前：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）'} · 三用途同步`)
           ),
 
           // ── 发送频率：与通道按钮并排 ─────────────────────────────────────
@@ -1705,6 +1722,79 @@ window.__ModuleLoader__.load({
             '开关与上限保存在状态文件里，桥接每次发送前热读，改完立即生效、不用重启。')
         ),
 
+        // ── 上下文节省：三档预设 + 滑块 + 自定义数值 ─────────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '上下文节省',
+              h('span', {
+                className: 'ar-tip',
+                tabIndex: 0,
+                'data-tip': contextDetail,
+                'aria-label': '上下文节省详情：档位、实际参数、预计节省比例'
+              }, h('span', { className: 'ar-tip-mark' }, '详情'))
+            ),
+            h('span', { className: 'ar-flag' }, `${contextPresetLabel} · 约省 ${contextSaving.estimatedSavingPercent}%`)
+          ),
+          h('div', { className: 'ar-policy-hint' },
+            '只裁剪「群上下文条数 / 每条字数 / 工具结果 / 重复注入的唤醒静态说明」；人设与角色卡一个字都不动。',
+            '默认均衡；桥接按状态文件热读，改完下一条消息立即生效，不用重启。'
+          ),
+          h('div', { className: 'ar-row' },
+            ...[['saver', '省'], ['balanced', '均衡'], ['quality', '质量优先']].map(([id, label]) =>
+              h('button', {
+                key: 'cs-' + id,
+                className: 'ar-btn' + (contextSaving.preset === id ? ' primary' : ''),
+                disabled: contextSavingBusy,
+                onClick: () => updateContextSaving({ preset: id }, `上下文节省已切换为「${label}」，桥接立即生效`)
+              }, label)
+            ),
+            h('span', { className: 'ar-sub' }, `当前：${contextPresetLabel}`)
+          ),
+          h('div', { className: 'ar-row' },
+            h('span', { className: 'ar-sub' }, '自定义'),
+            h('input', {
+              className: 'cs-slider',
+              type: 'range',
+              min: 0,
+              max: 100,
+              step: 5,
+              disabled: contextSavingBusy,
+              value: contextLevel,
+              onChange: (e) => setContextLevelDraft(Number(e.target.value)),
+              onPointerUp: saveContextLevel,
+              onKeyUp: (e) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) saveContextLevel() }
+            }),
+            h('span', { className: 'ar-sub' }, `${contextLevel}（0 最省 / 100 质量优先）`)
+          ),
+          h('div', { className: 'ar-row' },
+            h('span', { className: 'ar-sub' }, '历史条数'),
+            h('input', {
+              key: 'cs-hm-' + contextSaving.historyMessages,
+              className: 'ar-input cs-num', type: 'number', min: 2, max: 50, step: 1,
+              disabled: contextSavingBusy, defaultValue: contextSaving.historyMessages,
+              onBlur: (e) => saveContextField('historyMessages', e.target.value),
+              onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); saveContextField('historyMessages', e.target.value) } }
+            }),
+            h('span', { className: 'ar-sub' }, '每条字数'),
+            h('input', {
+              key: 'cs-hc-' + contextSaving.historyChars,
+              className: 'ar-input cs-num', type: 'number', min: 40, max: 600, step: 10,
+              disabled: contextSavingBusy, defaultValue: contextSaving.historyChars,
+              onBlur: (e) => saveContextField('historyChars', e.target.value),
+              onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); saveContextField('historyChars', e.target.value) } }
+            }),
+            h('span', { className: 'ar-sub' }, '工具结果'),
+            h('input', {
+              key: 'cs-tr-' + contextSaving.toolResultChars,
+              className: 'ar-input cs-num', type: 'number', min: 200, max: 8000, step: 100,
+              disabled: contextSavingBusy, defaultValue: contextSaving.toolResultChars,
+              onBlur: (e) => saveContextField('toolResultChars', e.target.value),
+              onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); saveContextField('toolResultChars', e.target.value) } }
+            }),
+            h('span', { className: 'ar-sub' }, `唤醒：${wakeStaticLabel} · 预计约省 ${contextSaving.estimatedSavingPercent}%`)
+          )
+        ),
+
         // ── 三种用途各自独立指定（修复 / 队列默认 / 全天回复） ────────────────
         h('div', { className: 'ar-policy' },
           h('div', { className: 'ar-policy-head' },
@@ -1712,15 +1802,13 @@ window.__ModuleLoader__.load({
             h('span', { className: 'ar-flag' }, `已启用 ${enabledOptions.length} 个模型`)
           ),
           h('div', { className: 'ar-policy-hint' },
-            '三处指定互相独立，改一个不会覆盖另外两个。',
-            '先在下面各厂商卡片里勾选「启用」（一家可以同时启用多个），再在这里分别指定用途；同一个模型可以被多处共用。'
+            '二选一后三处始终一致：不能单独指定某一个用途，切换运行通道时一起生效。',
+            '这里只做只读展示；需要换模型请在上方「运行通道」切换。'
           ),
           enabledOptions.length === 0
-            ? h('div', { className: 'ar-warnbox' }, '还没有启用任何模型：在下面卡片里勾选模型左侧的「启用」后，这里就能选了。')
+            ? h('div', { className: 'ar-warnbox' }, '还没有启用任何模型：在下面卡片里勾选模型左侧的「启用」后，这里就能显示。')
             : MODEL_USE_LABELS.map(([k, label, desc]) => {
               const cur = vendorUses[k]
-              const curVal = cur ? `${cur.provider}::${cur.model}` : ''
-              const curInList = curVal && enabledOptions.some((o) => o.key === curVal)
               return h('div', { className: 'ar-row', key: k },
                 h('span', { className: 'ar-sub' }, label,
                   k === 'reply'
@@ -1731,17 +1819,9 @@ window.__ModuleLoader__.load({
                       'aria-label': '全天回复详情：状态、当前模型、最近一分钟实发、上限、是否限流排队'
                     }, h('span', { className: 'ar-tip-mark' }, '详情'))
                     : null),
-                h('select', {
-                  className: 'ar-select',
-                  value: curVal,
-                  disabled: busyUse === k,
-                  onChange: (e) => assignUse(k, String(e.target.value || ''))
-                },
-                  k !== 'repair' ? h('option', { value: '' }, cur ? '（未指定，清空）' : '（未指定）') : null,
-                  !cur && k === 'repair' ? h('option', { value: '' }, '（未指定，请选一个）') : null,
-                  curVal && !curInList ? h('option', { value: curVal }, `${cur.provider} / ${cur.model}（当前，不在已启用列表）`) : null,
-                  enabledOptions.map((o) => h('option', { key: o.key, value: o.key }, o.label))
-                ),
+                h('span', { className: 'ar-sub', style: { minWidth: '220px' } },
+                  cur ? `${cur.provider} / ${cur.model}` : '跟随运行通道'),
+                h('span', { className: 'ar-sub' }, '跟随运行通道'),
                 h('span', { className: 'ar-sub' }, desc)
               )
             })
@@ -1869,7 +1949,6 @@ window.__ModuleLoader__.load({
                     (v.models || []).map((m) => {
                       const mk = `${v.id}::${m.id}`
                       const isOn = enabledKeys.has(mk)
-                      const isRepair = Boolean(vendorUses.repair && `${vendorUses.repair.provider}::${vendorUses.repair.model}` === mk)
                       const usedLabels = MODEL_USE_LABELS
                         .filter(([k]) => vendorUses[k] && `${vendorUses[k].provider}::${vendorUses[k].model}` === mk)
                         .map(([, label]) => label)
@@ -1890,13 +1969,7 @@ window.__ModuleLoader__.load({
                           : (isOn ? h('span', { className: 'vn-use-none' }, '已启用 · 未分配') : null),
                         m.note ? h('span', { className: 'vn-mnote' }, m.note) : null,
                         m.price ? h('span', { className: 'vn-price' }, m.price) : null,
-                        m.verified === false ? h('span', { className: 'vn-badge' }, '待确认') : null,
-                        h('button', {
-                          className: 'ar-btn vn-setrepair',
-                          disabled: busyUse === 'repair',
-                          title: '把这个模型指定为「让 AI 修」使用的模型',
-                          onClick: () => assignUse('repair', mk)
-                        }, isRepair ? '当前修复模型' : '设为修复模型')
+                        m.verified === false ? h('span', { className: 'vn-badge' }, '待确认') : null
                       )
                     })
                   )
@@ -2219,11 +2292,14 @@ window.__ModuleLoader__.load({
 
       function doSwitch() {
         if (!selProvider || !selModel) return
-        const scopes = MANAGE_SCOPE_ROWS.filter((r) => takeover[r.key]).map((r) => r.key)
-        if (!scopes.length) {
+        const picked = MANAGE_SCOPE_ROWS.filter((r) => takeover[r.key]).map((r) => r.key)
+        if (!picked.length) {
           setErr('下面没有任何一项被接管，先把要跟着变的那几项打开')
           return
         }
+        // 通道二选一：只要勾了任一用途，就强制把修复/队列/全天回复一起切，避免混用。
+        const hitUse = picked.some((k) => ['repair', 'queue', 'reply'].includes(k))
+        const scopes = hitUse ? [...new Set([...picked, 'repair', 'queue', 'reply'])] : picked
         setResults(null)
         send({ action: 'switch', provider: selProvider, model: selModel, scopes }, 'switch')
       }
@@ -2337,6 +2413,7 @@ window.__ModuleLoader__.load({
         // ② 接管范围（堆叠卡片：一项一块，窄容器下纵向排列，不横向挤出）
         h('div', { className: 'ar-card mg-sec' },
           h('div', { className: 'ar-section-title' }, '接管范围'),
+          h('div', { className: 'ar-policy-hint' }, '通道二选一：只要勾选任一用途，修复 / 队列默认 / 全天回复会强制一起切换，不能混用。'),
           h('div', { className: 'mg-scopes' },
             MANAGE_SCOPE_ROWS.map((row) =>
               h('div', { className: 'mg-scope', key: row.key },

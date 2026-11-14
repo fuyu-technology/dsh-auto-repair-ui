@@ -56,6 +56,7 @@ const MANAGE_PATH = `${API_BASE}/manage`
 const NOTIFY_PATH = `${API_BASE}/notify-policy`
 const REPEAT_ALERT_PATH = `${API_BASE}/repeat-alert`
 const SEND_RATE_PATH = `${API_BASE}/send-rate`
+const CONTEXT_SAVING_PATH = `${API_BASE}/context-saving`
 
 // 智谱开放平台（bigmodel.cn）OpenAI 兼容接口的官方地址（docs.bigmodel.cn）。
 const ZHIPU_DEFAULT_BASE = 'https://open.bigmodel.cn/api/paas/v4'
@@ -350,6 +351,48 @@ const ROUTE_PROFILES = {
 }
 const USE_LABEL = { repair: '修复', queue: '任务队列默认', reply: '全天回复' }
 
+// ── 通道互斥：DSH（DeepSeek）与 API（智谱）只能二选一 ────────────────────────
+// 任何一次写入都先把三个用途归一到同一个模型，再落盘；不再保存 route='custom'。
+function routeOfProvider(provider) {
+  return String(provider || '') === ROUTE_PROFILES.dsh.provider ? 'dsh' : 'api'
+}
+
+function writeModelChoiceFile(pair) {
+  try {
+    fs.mkdirSync(REPAIR_STATE, { recursive: true })
+    const tmp = path.join(REPAIR_STATE, 'model-choice.json.tmp')
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ provider: pair.provider, model: pair.model, updatedAt: Date.now() }, null, 2) + '\n',
+      'utf8'
+    )
+    fs.renameSync(tmp, path.join(REPAIR_STATE, 'model-choice.json'))
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 选一个“当前通道”的模型：三用途已一致就保留；混用时显式通道优先，否则以全天回复为准。 */
+function canonicalPairOf(uses, routeHint) {
+  const first = normalizeModelPair(uses?.reply?.provider, uses?.reply?.model)
+  const allSame = first && MODEL_USES.every((k) => samePair(uses?.[k], first))
+  if (allSame) return first
+  if (routeHint === 'api' || routeHint === 'dsh') {
+    const p = ROUTE_PROFILES[routeHint]
+    return { provider: p.provider, model: p.model }
+  }
+  for (const k of ['reply', 'repair', 'queue']) {
+    const one = normalizeModelPair(uses?.[k]?.provider, uses?.[k]?.model)
+    if (one) return one
+  }
+  return { provider: ROUTE_PROFILES.dsh.provider, model: ROUTE_PROFILES.dsh.model }
+}
+
+function samePair(a, b) {
+  return Boolean(a && b && pairKey(a) === pairKey(b))
+}
+
 function normalizeModelPair(provider, model) {
   const p = String(provider || '').trim()
   const m = String(model || '').trim()
@@ -394,30 +437,39 @@ function readModelUses() {
   // 迁移时把修复模型标成已启用，否则界面上会出现「指定了但没启用」的矛盾状态。
   if (migrated) pushEnabled(uses.repair)
 
-  const out = { version: 1, enabled, uses, route: 'custom', updatedAt: Number(src.updatedAt) || 0 }
-  // 运行通道：显式写 route；老文件按回复用途推断（deepseek-account → dsh，其它 → api）。
+  // 运行通道不再保存 custom：显式 route 优先，否则按回复用途推断；
+  // 然后把三个用途强制归一到同一通道的同一个模型，杜绝混用。
   const routeRaw = String(src.route || '').trim()
-  out.route = ['api', 'dsh', 'custom'].includes(routeRaw)
-    ? routeRaw
-    : (uses.reply?.provider === 'deepseek-account' ? 'dsh' : 'api')
-  // 首次读取/迁移时落盘一次，之后读写同一份文件，避免每次请求都重复迁移。
-  if (!doc || migrated) writeModelUses(out)
+  const routeHint = routeRaw === 'api' || routeRaw === 'dsh' ? routeRaw : ''
+  const canonical = canonicalPairOf(uses, routeHint)
+  const unifiedUses = { repair: canonical, queue: canonical, reply: canonical }
+  const changed = MODEL_USES.some((k) => !samePair(uses[k], canonical))
+  const out = { version: 1, enabled, uses: unifiedUses, route: routeOfProvider(canonical.provider), updatedAt: Number(src.updatedAt) || 0 }
+  // 首次读取、迁移、或发现混用/自定义态时落盘并同步 model-choice.json。
+  if (!doc || migrated || changed || !['api', 'dsh'].includes(routeRaw)) {
+    writeModelUses(out)
+  }
   return out
 }
 
 function writeModelUses(next) {
   try {
     fs.mkdirSync(REPAIR_STATE, { recursive: true })
+    const routeHint = next.route === 'api' || next.route === 'dsh' ? next.route : ''
+    const canonical = canonicalPairOf(next.uses, routeHint)
+    const uses = { repair: canonical, queue: canonical, reply: canonical }
     const doc = {
       version: 1,
       enabled: Array.isArray(next.enabled) ? next.enabled : [],
-      uses: next.uses || {},
-      route: ['api', 'dsh', 'custom'].includes(next.route) ? next.route : 'custom',
+      uses,
+      route: routeOfProvider(canonical.provider),
       updatedAt: Date.now()
     }
     const tmp = `${MODEL_USES_FILE}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8')
     fs.renameSync(tmp, MODEL_USES_FILE)
+    // 守护进程只认 model-choice.json，必须与三个用途保持同一模型。
+    writeModelChoiceFile(canonical)
     return doc
   } catch {
     return null
@@ -527,6 +579,84 @@ function readSendRateStats() {
 function sendRateSnapshot() {
   const cfg = readSendRate()
   return { enabled: cfg.enabled, perMinute: cfg.perMinute, updatedAt: cfg.updatedAt, stats: readSendRateStats() }
+}
+
+// 「上下文节省」：只裁剪历史条数/每条字数、工具结果、重复注入的唤醒静态说明。
+// 人设/角色卡不参与；默认 balanced。桥接按 mtime 热读，改完立即生效。
+const CONTEXT_SAVING_FILE = path.join(REPAIR_STATE, 'context-saving.json')
+const CONTEXT_PRESETS = {
+  saver: { historyMessages: 8, historyChars: 90, toolResultChars: 500, wakeStatic: 'once' },
+  balanced: { historyMessages: 15, historyChars: 200, toolResultChars: 1200, wakeStatic: 'light' },
+  quality: { historyMessages: 30, historyChars: 400, toolResultChars: 3000, wakeStatic: 'full' }
+}
+
+function normalizeContextSaving(doc = {}) {
+  const presetName = CONTEXT_PRESETS[doc.preset] ? doc.preset : 'custom'
+  const base = CONTEXT_PRESETS[presetName] || CONTEXT_PRESETS.balanced
+  const num = (v, min, max, fallback) => {
+    const n = Math.round(Number(v))
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback
+  }
+  return {
+    preset: presetName,
+    historyMessages: num(doc.historyMessages, 2, 50, base.historyMessages),
+    historyChars: num(doc.historyChars, 40, 600, base.historyChars),
+    toolResultChars: num(doc.toolResultChars, 200, 8000, base.toolResultChars),
+    wakeStatic: ['once', 'light', 'full'].includes(doc.wakeStatic) ? doc.wakeStatic : base.wakeStatic,
+    updatedAt: Number(doc.updatedAt) || 0
+  }
+}
+
+function readContextSaving() {
+  return normalizeContextSaving(readJson(CONTEXT_SAVING_FILE, null) || {})
+}
+
+function writeContextSaving(patch = {}) {
+  try {
+    let next
+    if (Number.isFinite(Number(patch.level))) {
+      // 滑块 0–100：0 = 最省，100 = 质量优先，中间线性插值。
+      const level = Math.max(0, Math.min(100, Number(patch.level)))
+      const lerp = (a, b) => Math.round(a + (b - a) * level / 100)
+      next = {
+        preset: level <= 30 ? 'saver' : level <= 70 ? 'balanced' : 'quality',
+        historyMessages: lerp(8, 30),
+        historyChars: lerp(90, 400),
+        toolResultChars: lerp(500, 3000),
+        wakeStatic: level <= 30 ? 'once' : level <= 70 ? 'light' : 'full',
+        updatedAt: Date.now()
+      }
+      if (Number.isFinite(Number(patch.historyMessages)) || Number.isFinite(Number(patch.historyChars)) || Number.isFinite(Number(patch.toolResultChars))) {
+        next.preset = 'custom'
+      }
+    } else {
+      const cur = readContextSaving()
+      const base = CONTEXT_PRESETS[patch.preset] ? CONTEXT_PRESETS[patch.preset] : null
+      next = normalizeContextSaving({
+        ...cur,
+        ...(base || {}),
+        ...patch,
+        preset: base ? patch.preset : 'custom',
+        updatedAt: Date.now()
+      })
+    }
+    fs.mkdirSync(REPAIR_STATE, { recursive: true })
+    const tmp = `${CONTEXT_SAVING_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, ...next }, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, CONTEXT_SAVING_FILE)
+    return { ok: true, ...next }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+}
+
+function contextSavingSnapshot() {
+  const cfg = readContextSaving()
+  const staticChars = cfg.wakeStatic === 'full' ? 4200 : cfg.wakeStatic === 'light' ? 3300 : 1200
+  const cost = cfg.historyMessages * cfg.historyChars + cfg.toolResultChars + staticChars
+  const q = CONTEXT_PRESETS.quality
+  const base = q.historyMessages * q.historyChars + q.toolResultChars + 4200
+  return { ...cfg, estimatedSavingPercent: Math.max(0, Math.min(95, Math.round((1 - cost / base) * 100))) }
 }
 
 function readNotifyPolicy() {
@@ -1138,9 +1268,39 @@ function apply(ctx) {
     }
   }))
 
+  // ── 上下文节省：滑块 / 三档预设（桥接热读，改完立即生效） ──────────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: CONTEXT_SAVING_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        sendJson(res, 200, { ok: true, contextSaving: contextSavingSnapshot() })
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        if (body.preset === undefined && body.level === undefined
+          && body.historyMessages === undefined && body.historyChars === undefined
+          && body.toolResultChars === undefined && body.wakeStatic === undefined) {
+          sendJson(res, 400, { ok: false, error: '没有要改的字段' })
+          return
+        }
+        if (body.preset !== undefined && body.preset !== 'custom' && !CONTEXT_PRESETS[body.preset]) {
+          sendJson(res, 400, { ok: false, error: 'preset 只能是 saver / balanced / quality / custom' })
+          return
+        }
+        const r = writeContextSaving(body)
+        sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, contextSaving: contextSavingSnapshot() } : r)
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
   // ── 本地用量（口径：本地统计，非厂商账单） ────────────────────────────────
   const USAGE_PATH = `${API_BASE}/usage`
-  // 不再写死绝对路径：按「插件目录 → auto-repair → 仓库布局」依次找存在的文件，
+  // 不再写死 D:\大肥鱼：按「插件目录 → auto-repair → 仓库布局」依次找存在的文件，
   // 别人 clone 到别处安装也能用；找不到就明确报错，而不是 import 崩在那里。
   const firstExisting = (candidates) => {
     for (const c of candidates) {
@@ -1441,19 +1601,12 @@ function apply(ctx) {
           sendJson(res, 400, { ok: false, error: `不认识的用途：${use || '(空)'}` })
           return
         }
-        // 清空某个用途的指定（「修复」必须留一个模型，守护进程没有「不指定」状态）
+        // 不再允许单独清空某个用途：三用途必须跟随同一个运行通道。
         if (body.clearUse === true) {
-          if (use === 'repair') {
-            sendJson(res, 200, { ok: false, error: '「修复」用途必须指定一个模型，不能清空' })
-            return
-          }
-          const uses = { ...doc.uses, [use]: null }
-          const saved = writeModelUses({ ...doc, uses, route: 'custom' })
-          if (!saved) {
-            sendJson(res, 200, { ok: false, error: '写入 model-uses.json 失败' })
-            return
-          }
-          sendJson(res, 200, { ok: true, use, uses: saved.uses, enabled: saved.enabled })
+          sendJson(res, 200, {
+            ok: false,
+            error: '运行通道是二选一，三个用途始终一起生效，不支持单独清空；请直接切换运行通道'
+          })
           return
         }
         if (!provider || !model) {
@@ -1464,17 +1617,16 @@ function apply(ctx) {
           sendJson(res, 400, { ok: false, error: `${provider} 下没有 ${model} 这个模型` })
           return
         }
-        if (use === 'repair') {
-          const w = await writeRepairChoice(provider, model)
-          if (!w.ok) {
-            sendJson(res, 200, { ok: false, error: w.error })
-            return
-          }
-        }
-        const uses = { ...doc.uses, [use]: { provider, model } }
-        const key = `${provider}::${model}`
-        const enabled = doc.enabled.some((x) => pairKey(x) === key) ? doc.enabled : [...doc.enabled, { provider, model }]
-        const saved = writeModelUses({ ...doc, uses, enabled, route: 'custom' })
+        // 任何单用途改动都强制同步到三个用途，并同步 model-choice.json；
+        // 这样即使从旧界面/第三方调用，也不会再出现 DSH 与 API 混用。
+        const pair = { provider, model }
+        const enabled = doc.enabled.some((x) => pairKey(x) === pairKey(pair)) ? doc.enabled : [...doc.enabled, pair]
+        const saved = writeModelUses({
+          ...doc,
+          uses: { repair: pair, queue: pair, reply: pair },
+          enabled,
+          route: routeOfProvider(provider)
+        })
         if (!saved) {
           sendJson(res, 200, { ok: false, error: '写入 model-uses.json 失败' })
           return
@@ -1482,9 +1634,11 @@ function apply(ctx) {
         sendJson(res, 200, {
           ok: true,
           use,
+          forcedSync: true,
+          route: saved.route,
           uses: saved.uses,
           enabled: saved.enabled,
-          current: use === 'repair' ? readModelChoiceFile() : undefined
+          current: readModelChoiceFile()
         })
         return
       }
@@ -1527,18 +1681,7 @@ function apply(ctx) {
         sendJson(res, 200, { ok: false, error: '写入 model-uses.json 失败' })
         return
       }
-      // 修复用途还认 state/model-choice.json（守护进程只读那个文件），一起同步。
-      try {
-        fs.mkdirSync(REPAIR_STATE, { recursive: true })
-        fs.writeFileSync(
-          path.join(REPAIR_STATE, 'model-choice.json'),
-          JSON.stringify({ provider: profile.provider, model: profile.model, updatedAt: Date.now() }, null, 2) + '\n',
-          'utf8'
-        )
-      } catch (e) {
-        sendJson(res, 200, { ok: false, error: `运行通道已切换，但同步修复模型失败：${e?.message || e}` })
-        return
-      }
+      // writeModelUses 已同步 state/model-choice.json（守护进程只认那个文件）。
       sendJson(res, 200, { ok: true, route: saved.route, uses: saved.uses, enabled: saved.enabled, profiles: ROUTE_PROFILES })
     }
   }))
@@ -2343,6 +2486,7 @@ function apply(ctx) {
   async function snapshotVendors() {
     const meta = await vendorMeta()
     const map = await vendorModelsMap()
+    const usesDoc = readModelUses()
     const vendors = await Promise.all((meta.vendors || []).map(async (v) => {
       const group = map[v.id]
       const key = v.keyEnv
@@ -2367,9 +2511,11 @@ function apply(ctx) {
     return {
       ok: true,
       vendors,
-      uses: readModelUses().uses,
-      enabled: readModelUses().enabled,
+      uses: usesDoc.uses,
+      enabled: usesDoc.enabled,
+      route: usesDoc.route,
       sendRate: sendRateSnapshot(),
+      contextSaving: contextSavingSnapshot(),
       queue: { running: Boolean(zhipuPumpPromise), tasks: readZhipuQueue().tasks },
       routeFile: ROUTE_PATCH_FILE,
       routeNeeded: vendors.some((v) => !v.available)
@@ -2687,37 +2833,33 @@ function apply(ctx) {
 
           const results = []
           const usesDoc = readModelUses()
-          let usesChanged = false
           const enableOne = () => {
             if (!usesDoc.enabled.some((e) => pairKey(e) === pairKey(target))) {
               usesDoc.enabled.push({ provider: target.provider, model: target.model })
             }
           }
 
-          if (scopes.includes('repair')) {
-            const r = await writeRepairChoice(target.provider, target.model)
-            if (r.ok) {
-              usesDoc.uses.repair = { provider: target.provider, model: target.model }
-              enableOne()
-              usesChanged = true
-              results.push({ scope: 'repair', ok: true, message: '已写入 model-choice.json，守护进程下次运行即用' })
-            } else {
-              results.push({ scope: 'repair', ok: false, message: r.error || '写入失败' })
+          // 通道互斥：只要命中任一用途，就把修复/队列/全天回复一起切到同一个模型，
+          // 不再支持“只改某一个用途”，避免旧入口制造 DSH 与 API 混用。
+          const useScopes = scopes.filter((s) => ['repair', 'queue', 'reply'].includes(s))
+          if (useScopes.length) {
+            const pair = { provider: target.provider, model: target.model }
+            enableOne()
+            const saved = writeModelUses({
+              ...usesDoc,
+              uses: { repair: pair, queue: pair, reply: pair },
+              route: routeOfProvider(target.provider)
+            })
+            for (const s of useScopes) {
+              results.push({
+                scope: s,
+                ok: Boolean(saved),
+                message: saved
+                  ? '三用途已一起切换为同一通道模型；桥接下一条消息、守护进程下次运行立即生效'
+                  : '写入 model-uses.json 失败'
+              })
             }
           }
-          if (scopes.includes('queue')) {
-            usesDoc.uses.queue = { provider: target.provider, model: target.model }
-            enableOne()
-            usesChanged = true
-            results.push({ scope: 'queue', ok: true, message: '之后新加的任务默认用它（即时生效）' })
-          }
-          if (scopes.includes('reply')) {
-            usesDoc.uses.reply = { provider: target.provider, model: target.model }
-            enableOne()
-            usesChanged = true
-            results.push({ scope: 'reply', ok: true, message: '桥接每条消息热读，下一条消息起生效（无需重启）' })
-          }
-          if (usesChanged) writeModelUses(usesDoc)
 
           if (scopes.includes('bridge')) {
             const r = writeBridgeModel(target.provider, target.model)
