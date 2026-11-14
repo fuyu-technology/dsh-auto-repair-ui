@@ -322,6 +322,8 @@ window.__ModuleLoader__.load({
       const [policyBusy, setPolicyBusy] = useState(false)
       // 自动修复通知策略（总开关）：notify = 照常推送；silent = 只修不推
       const [notifyBusy, setNotifyBusy] = useState(false)
+      // 同一故障重复出现的提醒开关：on = 照旧提醒；off = 重复出现时不再弹
+      const [repeatAlertBusy, setRepeatAlertBusy] = useState(false)
       const [models, setModels] = useState(null)
       const [modelBusy, setModelBusy] = useState(false)
       // 本机模型客户端（TRAE / MiniMax）：扫描结果 + 手动改路径时的草稿
@@ -524,6 +526,27 @@ window.__ModuleLoader__.load({
         }
       }, [postJson, load])
 
+      /** 改「同一故障重复出现」的提醒开关 */
+      const setRepeatAlertMode = useCallback(async (mode) => {
+        setRepeatAlertBusy(true)
+        setToast(null)
+        try {
+          const r = await postJson('/repeat-alert', { mode })
+          if (r && r.ok) {
+            setToast({ ok: true, text: mode === 'off'
+              ? '已关闭重复故障提醒：同一故障再次出现时不再弹提醒，修复和历史照常记录'
+              : '已开启重复故障提醒：同一故障再次出现时会照常提醒' })
+          } else {
+            setToast({ ok: false, text: r?.error || '改重复故障提醒失败' })
+          }
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setRepeatAlertBusy(false)
+        }
+      }, [postJson, load])
+
       /** 选「让 AI 修」用哪个模型/提供方（只存 provider/model，不碰任何 Key） */
       const setModel = useCallback(async (provider, model) => {
         setModelBusy(true)
@@ -653,6 +676,9 @@ window.__ModuleLoader__.load({
       const notifyHint = notifyMode === 'silent'
         ? '当前「完全不发」：自动修复照常执行，但需求箱、QQ 私聊、Windows 气泡一条都不推（含全天回复自己发的提示，比如余额不足自动关闭）；修复历史和日志照常记录。'
         : '当前「发通知」：自动修复的消息和全天回复自己发的提示都照常推送（需求箱 / QQ 私聊 / Windows 气泡），文案与现在一致。'
+
+      // 同一故障重复出现的提醒开关：默认 on，只有明确存了 off 才屏蔽
+      const repeatAlertMode = d.repeatAlert && d.repeatAlert.mode === 'off' ? 'off' : 'on'
 
       // 模型卡片用的数据（/models 拉不到时也要能把面板画出来）
       const modelProviders = Array.isArray(models?.providers) ? models.providers : []
@@ -801,6 +827,33 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: 'ar-policy-hint', style: { marginTop: '8px' } },
             '这一个总开关同时管自动修复的全部对外消息：待你审批、自动修复成功、自动修复未成功、需要你处理；渠道包括需求箱、QQ 私聊和 Windows 气泡。选「完全不发」时这些一律不推，但修复照常执行，面板的修复历史和 auto-repair.log 仍照常记录。全天回复自己发的提示（例如余额不足自动关闭全天回复）也受这个开关控制：选「完全不发」时同样不推，只在 bridge.log 和面板活动里记录。')
+        ),
+
+        // ── 同一故障重复出现的提醒（和上面的总开关并列，互不影响） ─────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, '重复故障提醒'),
+            h('span', { className: 'ar-policy-hint' },
+              repeatAlertMode === 'off'
+                ? '当前「不提醒」：同一故障再次出现时不再弹提醒（面板、需求箱、QQ、气泡都不弹），但故障照常记录、修复照常执行，修复历史里仍能看到它出现了多少次。'
+                : '当前「提醒」：同一故障每次出现都会照常提醒。')
+          ),
+          h('div', { className: 'ar-row' },
+            h('div', { className: 'ar-seg' },
+              h('button', {
+                className: `ar-seg-btn ${repeatAlertMode === 'on' ? 'on' : ''}`,
+                disabled: repeatAlertBusy,
+                onClick: () => setRepeatAlertMode('on')
+              }, '提醒'),
+              h('button', {
+                className: `ar-seg-btn ${repeatAlertMode === 'off' ? 'on' : ''}`,
+                disabled: repeatAlertBusy,
+                onClick: () => setRepeatAlertMode('off')
+              }, '不提醒')
+            )
+          ),
+          h('div', { className: 'ar-policy-hint', style: { marginTop: '8px' } },
+            '只管「同一个故障反复出现」这一类提醒，不改变「怎么算重复」：判定仍沿用现有规则（故障代码 + 级别 + 标题 + 现象文本相同，30 分钟内算同一次）。首次出现的提醒始终保留；上方的「通知策略」总开关仍然优先，选「完全不发」时这里开不开都不会推送。')
         ),
 
         // ── AI 模型（「让 AI 修」用哪个提供方/模型） ──────────────────────
@@ -1794,12 +1847,13 @@ window.__ModuleLoader__.load({
       // 用量（本地账本，非厂商账单）
       const [usageDays, setUsageDays] = useState(7)
       const [usageSrc, setUsageSrc] = useState('all')
+      const [usageEra, setUsageEra] = useState('all')
       const [usage, setUsage] = useState(null)
       const [usageErr, setUsageErr] = useState('')
 
-      const loadUsage = useCallback(async (days, src) => {
+      const loadUsage = useCallback(async (days, src, era) => {
         try {
-          const r = await fetchJson(`/usage?days=${days}&source=${encodeURIComponent(src)}`, { cache: 'no-store' })
+          const r = await fetchJson(`/usage?days=${days}&source=${encodeURIComponent(src)}&era=${encodeURIComponent(era)}`, { cache: 'no-store' })
           if (r && r.ok === false) throw new Error(r.error || '读取用量失败')
           setUsage(r)
           setUsageErr('')
@@ -1807,7 +1861,7 @@ window.__ModuleLoader__.load({
           setUsageErr(e?.message || String(e))
         }
       }, [])
-      useEffect(() => { loadUsage(usageDays, usageSrc) }, [loadUsage, usageDays, usageSrc])
+      useEffect(() => { loadUsage(usageDays, usageSrc, usageEra) }, [loadUsage, usageDays, usageSrc, usageEra])
 
       const load = useCallback(async () => {
         try {
@@ -1895,9 +1949,45 @@ window.__ModuleLoader__.load({
         return String(v)
       }
       const fmtCost = (n, sym) => `${sym || '¥'}${(Number(n) || 0).toFixed(4)}`
+      const fmtTokShort = (n) => {
+        const v = Number(n) || 0
+        if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
+        if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`
+        return String(v)
+      }
       const usSeries = (usage && usage.series) || []
       const usMax = Math.max(1, ...usSeries.map((s) => Number(s.tokens) || 0))
       const usSym = usage?.meta?.symbol || '¥'
+      const usMeta = (usage && usage.meta) || {}
+      const usEraCount = usMeta.eraCount || { legacy: { count: 0 }, current: { count: 0 } }
+
+      // 两张小计表共用同一份列定义（宽度/对齐一致），保证表头与数字在同一列结构里。
+      const US_COLS = [
+        { key: 'name', label: '厂商', w: 'auto' },
+        { key: 'count', label: '次数', w: '56px', num: true },
+        { key: 'tokens', label: 'Tokens', w: '78px', num: true },
+        { key: 'cost', label: '估算花费', w: '94px', num: true }
+      ]
+      const usTable = (firstLabel, rows, keyOf) => h('table', { className: 'us-table' },
+        h('colgroup', null, US_COLS.map((c) => h('col', { key: c.key, style: { width: c.w } }))),
+        h('thead', null,
+          h('tr', null, US_COLS.map((c, i) =>
+            h('th', { key: c.key, className: c.num ? 'num' : null }, i === 0 ? firstLabel : c.label)))
+        ),
+        h('tbody', null,
+          (rows || []).map((r) =>
+            h('tr', { key: keyOf(r) },
+              h('td', { className: 'name' }, keyOf(r) || '未知'),
+              h('td', { className: 'num' }, String(r.count)),
+              h('td', { className: 'num', title: `${Number(r.tokens) || 0} tokens` }, fmtTokShort(r.tokens)),
+              h('td', { className: 'num' }, r.unpriced && !r.cost ? '未计价' : fmtCost(r.cost, usSym))
+            )
+          ),
+          !(rows && rows.length)
+            ? h('tr', null, h('td', { colSpan: 4, className: 'name' }, '这个范围内还没有记录'))
+            : null
+        )
+      )
 
       function doSwitch() {
         if (!selProvider || !selModel) return
@@ -1951,11 +2041,13 @@ window.__ModuleLoader__.load({
           .us-seg-btn.on{background:rgba(127,127,127,.18);border-color:rgba(127,127,127,.5);font-weight:600}
           .us-chart{width:100%;height:96px;display:block;margin:6px 0 2px;overflow:visible}
           .us-axis{display:flex;justify-content:space-between;font-size:10.5px;opacity:.6;gap:8px}
-          .us-table{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:6px}
-          .us-table th{text-align:left;font-weight:600;opacity:.7;padding:3px 6px;border-bottom:1px solid rgba(127,127,127,.2);white-space:nowrap}
-          .us-table td{padding:3px 6px;border-bottom:1px solid rgba(127,127,127,.1);vertical-align:top}
-          .us-table td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-          .us-table td.name{overflow-wrap:anywhere}
+          .us-table{table-layout:fixed;width:100%;border-collapse:collapse;font-size:11.5px;margin-top:8px}
+          .us-table th{text-align:left;font-weight:600;opacity:.7;padding:3px 8px;border-bottom:1px solid rgba(127,127,127,.2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .us-table td{padding:3px 8px;border-bottom:1px solid rgba(127,127,127,.1);vertical-align:top;overflow:hidden;text-overflow:ellipsis}
+          .us-table th.num,.us-table td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+          .us-table td.name{white-space:normal;overflow-wrap:anywhere}
+          .us-table th:first-child,.us-table td:first-child{padding-left:2px}
+          .us-table th:last-child,.us-table td:last-child{padding-right:10px}
           .us-cap{font-size:11px;opacity:.65;margin-top:10px}
           .us-err{font-size:11.5px;color:#c0392b;margin-top:6px;overflow-wrap:anywhere}
         `),
@@ -2092,6 +2184,18 @@ window.__ModuleLoader__.load({
               onClick: () => setUsageSrc(s.id)
             }, s.label))
           ),
+          h('div', { className: 'us-seg' },
+            [
+              { id: 'all', label: '全部时期' },
+              { id: 'legacy', label: `历史·切换前（${usEraCount.legacy?.count || 0}）` },
+              { id: 'current', label: `当前·智谱等（${usEraCount.current?.count || 0}）` }
+            ].map((e) => h('button', {
+              key: e.id,
+              className: `us-seg-btn ${usageEra === e.id ? 'on' : ''}`,
+              onClick: () => setUsageEra(e.id)
+            }, e.label))
+          ),
+          h('div', { className: 'ar-note' }, '「历史」是切到智谱之前、桥接记下的 DeepSeek 账，原样保留不改写；「当前」是之后用智谱等模型的账。两类分开看。'),
           h('svg', { className: 'us-chart', viewBox: '0 0 700 90', preserveAspectRatio: 'none', role: 'img', 'aria-label': `近 ${usageDays} 天按天 tokens 柱状图` },
             h('line', { x1: 0, y1: 89, x2: 700, y2: 89, stroke: 'rgba(127,127,127,.35)', strokeWidth: 1 }),
             usSeries.map((s, i) => {
@@ -2111,49 +2215,13 @@ window.__ModuleLoader__.load({
             h('span', null, usSeries[0]?.d || '—'),
             h('span', null, usSeries[usSeries.length - 1]?.d || '—')
           ),
-          h('table', { className: 'us-table' },
-            h('thead', null,
-              h('tr', null,
-                h('th', null, '厂商'),
-                h('th', { className: 'num' }, '次数'),
-                h('th', { className: 'num' }, 'Tokens'),
-                h('th', { className: 'num' }, '估算花费')
-              )
-            ),
-            h('tbody', null,
-              ((usage && usage.byProvider) || []).slice(0, 6).map((r) =>
-                h('tr', { key: r.provider },
-                  h('td', { className: 'name' }, r.provider),
-                  h('td', { className: 'num' }, String(r.count)),
-                  h('td', { className: 'num' }, fmtTok(r.tokens)),
-                  h('td', { className: 'num' }, r.unpriced && !r.cost ? '未计价' : fmtCost(r.cost, usSym))
-                )
-              ),
-              !(usage && usage.byProvider && usage.byProvider.length)
-                ? h('tr', null, h('td', { colSpan: 4, className: 'name' }, '这个范围内还没有记录'))
-                : null
-            )
-          ),
-          h('table', { className: 'us-table' },
-            h('thead', null,
-              h('tr', null,
-                h('th', null, '模型'),
-                h('th', { className: 'num' }, '次数'),
-                h('th', { className: 'num' }, 'Tokens'),
-                h('th', { className: 'num' }, '估算花费')
-              )
-            ),
-            h('tbody', null,
-              ((usage && usage.byModel) || []).slice(0, 8).map((r) =>
-                h('tr', { key: r.model },
-                  h('td', { className: 'name' }, r.model),
-                  h('td', { className: 'num' }, String(r.count)),
-                  h('td', { className: 'num' }, fmtTok(r.tokens)),
-                  h('td', { className: 'num' }, r.unpriced && !r.cost ? '未计价' : fmtCost(r.cost, usSym))
-                )
-              )
-            )
-          ),
+          usTable('厂商', ((usage && usage.byProvider) || []).slice(0, 6), (r) => r.provider),
+          usTable('模型', ((usage && usage.byModel) || []).slice(0, 8), (r) => r.model),
+          (usMeta.recovered || usMeta.unknown)
+            ? h('div', { className: 'ar-note' },
+              `厂商/模型缺失：已按同会话上下文回填 ${usMeta.recovered || 0} 条` +
+              (usMeta.unknown ? `；仍有 ${usMeta.unknown} 条无法判断，保留「未知」。` : '，当前范围内没有「未知」条目。'))
+            : null,
           h('div', { className: 'us-cap' },
             '来源：全天回复读桥接的逐次 token 账本；修复由「让 AI 修」在每轮结束时按 step 写入；队列由 DSH 内部执行、桥接兜底目前未触发，两者暂无采集点（显示 0 属正常）。账本保留 90 天，超期自动清理。价目表里没有的厂商/模型显示「未计价」，不按兜底价编造。')
         )

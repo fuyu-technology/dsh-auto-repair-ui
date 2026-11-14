@@ -45,7 +45,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { diagnoseAll, SEVERITY, ROOT, dshPorts } from './diagnose.mjs'
 import { applyRepair, FIXERS, NEEDS_HUMAN } from './repair.mjs'
-import { notify, readNotifyPolicy } from './notify.mjs'
+import { notify, readNotifyPolicy, repeatAlertGate } from './notify.mjs'
 import { readPolicy, writePolicy, canAutoRepair, isRejected, MODES } from './policy.mjs'
 import { readHandoffs, writeHandoff, feedHashOf, shouldFeed, markFed } from './agent-repair.mjs'
 import { listModels, readChoice, writeChoice, findModel, readinessOf } from './models.mjs'
@@ -308,6 +308,24 @@ async function maybeHandoff(finding, policy, handoffs, { manual = false } = {}) 
 let lastNotified = new Map()
 
 /**
+ * 故障提醒的统一出口：先按指纹记一次「又出现了」，再决定要不要弹提醒。
+ *
+ * 判定「重复」沿用投喂去重那一套（code + 级别 + 标题 + 现象文本），
+ * 不另立标准。面板里「重复故障提醒」关掉后，重复出现的那几次不再弹，
+ * 但修复、repair-history、守护日志照常，一条不少。
+ */
+async function notifyFault(f, title, detail, kind = 'l1') {
+  try {
+    const { suppress, count } = repeatAlertGate(feedHashOf(f))
+    if (suppress) {
+      log(`   🔇 重复故障提醒已关闭，跳过提醒：${f.code}（该故障累计 ${count} 次）`)
+      return
+    }
+  } catch {}
+  return notify(title, detail, kind)
+}
+
+/**
  * 跑一轮。
  *
  * @param {object} opts
@@ -361,7 +379,7 @@ async function runOnce({ dryRun = false, policy = readPolicy(), forceRepair = fa
       if (f.severity === SEVERITY.FATAL) {
         const last = lastNotified.get(f.code) || 0
         if (Date.now() - last > 10 * 60 * 1000) {
-          await notify(`❓ 待你审批：${f.title}`, `${f.detail}\n\n打开设置页 → 自愈 → 点「修复」。`, 'l1')
+          await notifyFault(f, `❓ 待你审批：${f.title}`, `${f.detail}\n\n打开设置页 → 自愈 → 点「修复」。`, 'l1')
           lastNotified.set(f.code, Date.now())
         }
       }
@@ -380,13 +398,13 @@ async function runOnce({ dryRun = false, policy = readPolicy(), forceRepair = fa
       log(`   ✅ ${r.action}`)
       if (r.detail) log(r.detail.split('\n').map((l) => '      ' + l).join('\n'))
       writeOutcome(f.code, 'plugin', r.action)
-      await notify(`✅ 自动修复：${f.title}`, `${r.action}\n${r.detail || f.detail}`, 'l1')
+      await notifyFault(f, `✅ 自动修复：${f.title}`, `${r.action}\n${r.detail || f.detail}`, 'l1')
     } else {
       const needHuman = r.action.includes('需人工')
       log(`   ${needHuman ? 'ℹ️' : '⚠️'} ${r.action}`)
       // 只对需要人管的严重问题播报，避免刷屏
       if (f.severity === SEVERITY.FATAL && !needHuman) {
-        await notify(`⚠️ 自动修复未成功：${f.title}`, `${r.action}\n${f.detail}`, 'sos')
+        await notifyFault(f, `⚠️ 自动修复未成功：${f.title}`, `${r.action}\n${f.detail}`, 'sos')
       } else if (needHuman && (f.severity === SEVERITY.FATAL || f.severity === SEVERITY.WARN)) {
         // 同一个问题 10 分钟内只播报一次
         const last = lastNotified.get(f.code) || 0
@@ -394,7 +412,7 @@ async function runOnce({ dryRun = false, policy = readPolicy(), forceRepair = fa
           const hint = f.code === 'MCP_CLIENTS_DOWN'
             ? '\n\n处理办法：运行 node D:\\大肥鱼\\restart-dsh.mjs 2 重启 DSH，MCP client 会随启动重新拉起。'
             : ''
-          await notify(`❓ 需要你处理：${f.title}`, f.detail + hint, f.severity === SEVERITY.FATAL ? 'sos' : 'l1')
+          await notifyFault(f, `❓ 需要你处理：${f.title}`, f.detail + hint, f.severity === SEVERITY.FATAL ? 'sos' : 'l1')
           lastNotified.set(f.code, Date.now())
         }
       }

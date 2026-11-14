@@ -104,6 +104,16 @@ export function appendUsage(entry, { prune = false } = {}) {
   }
 }
 
+/** 按模型名反推厂商（只在账本缺 provider 时兜底用）。 */
+function inferProvider(model) {
+  const m = String(model || '').toLowerCase()
+  if (!m) return ''
+  if (m.includes('deepseek')) return 'deepseek-account'
+  if (m.includes('glm')) return 'zhipu'
+  if (m.includes('minimax')) return 'minimax-cn'
+  return ''
+}
+
 function readJsonLines(file) {
   const out = []
   let text = ''
@@ -124,14 +134,34 @@ function readJsonLines(file) {
 export function readUsageRecords({ sinceMs = 0, includeTest = false } = {}) {
   const since = Number(sinceMs) || 0
   const out = []
+  let unknown = 0
+  let recovered = 0
   for (const rec of readJsonLines(USAGE_FILE)) {
     if (rec?.test && !includeTest) continue
     if (Number(rec?.t) < since) continue
     const n = normalize(rec)
-    if (n) { n.kind = 'ledger'; out.push(n) }
+    if (!n) continue
+    if (!n.m) {
+      // 老格式/异常写入没带模型：先用原始行里的线索补，补不回来才算未知。
+      const hint = String(rec?.b?.model || rec?.b?.m || '')
+      if (hint) n.m = hint
+    }
+    if (!n.p && n.m) { n.p = inferProvider(n.m); if (n.p) recovered += 1 }
+    if (!n.m) unknown += 1
+    n.kind = 'ledger'
+    out.push(n)
   }
+  const turnLines = []
+  const bySid = new Map()
   for (const rec of readJsonLines(TOKEN_LEDGER_FILE)) {
     if (rec?.k !== 'turn') continue
+    turnLines.push(rec)
+    if (rec.model) {
+      if (!bySid.has(rec.sid)) bySid.set(rec.sid, [])
+      bySid.get(rec.sid).push(rec)
+    }
+  }
+  for (const rec of turnLines) {
     if (Number(rec?.t) < since) continue
     const b = rec.b && typeof rec.b === 'object' ? {
       cacheMiss: Number(rec.b.cacheMiss) || 0,
@@ -142,16 +172,30 @@ export function readUsageRecords({ sinceMs = 0, includeTest = false } = {}) {
     const input = sumInput(b)
     const output = b?.output ?? 0
     if (input + output <= 0) continue
+    let model = String(rec.model || '')
+    let provider = String(rec.provider || '')
+    if (!model) {
+      // 回填：同一会话里离它最近的一条带模型的记录，通常是同一次回答的不同 step。
+      const sib = bySid.get(rec.sid) || []
+      if (sib.length) {
+        const near = sib.reduce((a, x) => (Math.abs(x.t - rec.t) < Math.abs(a.t - rec.t) ? x : a))
+        model = String(near.model || '')
+        if (!provider) provider = String(near.provider || '')
+        if (model) recovered += 1
+      }
+    }
+    if (model && !provider) { provider = inferProvider(model); if (provider) recovered += 1 }
+    if (!model) unknown += 1
     out.push({
       v: 1, t: Number(rec.t) || 0, src: 'reply',
-      p: String(rec.provider || ''), m: String(rec.model || ''),
+      p: provider, m: model,
       input, output, ms: 0, ok: true, err: '',
       missing: false, test: false, kind: 'reply-ledger',
       ...(b ? { b } : {})
     })
   }
   out.sort((a, b) => a.t - b.t)
-  return out
+  return { records: out, stats: { unknown, recovered } }
 }
 
 /** 删掉所有 test:true 的测试记录（验证完清场用）。返回删掉的行数。 */

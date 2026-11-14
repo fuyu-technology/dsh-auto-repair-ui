@@ -52,6 +52,7 @@ const ZHIPU_PATH = `${API_BASE}/zhipu`
 const VENDORS_PATH = `${API_BASE}/vendors`
 const MANAGE_PATH = `${API_BASE}/manage`
 const NOTIFY_PATH = `${API_BASE}/notify-policy`
+const REPEAT_ALERT_PATH = `${API_BASE}/repeat-alert`
 
 // 智谱开放平台（bigmodel.cn）OpenAI 兼容接口的官方地址（docs.bigmodel.cn）。
 const ZHIPU_DEFAULT_BASE = 'https://open.bigmodel.cn/api/paas/v4'
@@ -454,6 +455,38 @@ function writeNotifyPolicy(mode) {
   }
 }
 
+// 「同一故障重复出现」的提醒开关：和通知总开关并列，互不影响。
+// on（默认）= 照旧提醒；off = 同一故障再次出现时不弹提醒，但修复与历史照常。
+const REPEAT_ALERT_FILE = path.join(REPAIR_STATE, 'repeat-alert.json')
+
+function readRepeatAlert() {
+  const doc = readJson(REPEAT_ALERT_FILE, null) || {}
+  return {
+    mode: doc.mode === 'off' ? 'off' : 'on',
+    updatedAt: Number(doc.updatedAt) || 0
+  }
+}
+
+function writeRepeatAlert(mode) {
+  const next = mode === 'off' ? 'off' : 'on'
+  try {
+    fs.mkdirSync(REPAIR_STATE, { recursive: true })
+    const old = readJson(REPEAT_ALERT_FILE, null)
+    const doc = {
+      ...(old && typeof old === 'object' ? old : {}),
+      version: 1,
+      mode: next,
+      updatedAt: Date.now()
+    }
+    const tmp = `${REPEAT_ALERT_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, REPEAT_ALERT_FILE)
+    return { ok: true, mode: doc.mode, updatedAt: doc.updatedAt }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+}
+
 /** 读 profile 里的 agent-default-model（DSH 本体跑会话用的模型） */
 function readAgentDefault() {
   try {
@@ -685,6 +718,8 @@ async function collectStatus() {
     policy,
     // 通知策略：notify = 照常推送；silent = 一条都不发（修照常修）
     notify: readNotifyPolicy(),
+    // 重复故障提醒：on = 照旧提醒；off = 同一故障再次出现时不弹（修复与记录照常）
+    repeatAlert: readRepeatAlert(),
     // findings 里每条都带了 fixable / needsHuman / rejected / handoff（由守护进程 enrich）
     findings,
     counters: counters(),
@@ -956,6 +991,30 @@ function apply(ctx) {
     }
   }))
 
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: REPEAT_ALERT_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        sendJson(res, 200, { ok: true, repeatAlert: readRepeatAlert() })
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        const mode = String(body.mode || '')
+        if (mode !== 'on' && mode !== 'off') {
+          sendJson(res, 400, { ok: false, error: 'mode 只能是 on 或 off' })
+          return
+        }
+        const r = writeRepeatAlert(mode)
+        sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, repeatAlert: { mode: r.mode, updatedAt: r.updatedAt } } : r)
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
   // ── 本地用量（口径：本地统计，非厂商账单） ────────────────────────────────
   const USAGE_PATH = `${API_BASE}/usage`
   const USAGE_STORE = pathToFileURL('D:\\大肥鱼\\auto-repair\\usage.mjs').href
@@ -975,12 +1034,24 @@ function apply(ctx) {
         if (method === 'GET') {
           const days = Number(url.searchParams.get('days')) === 30 ? 30 : 7
           const source = String(url.searchParams.get('source') || 'all')
+          const era = ['legacy', 'current'].includes(String(url.searchParams.get('era') || '')) ? String(url.searchParams.get('era')) : 'all'
           const includeTest = url.searchParams.get('test') === '1'
           // 从「days 天前的北京 0 点」开始，避免按滚动 24h 切割自然日。
           const todayStart = new Date(`${dayKeyOf(Date.now())}T00:00:00+08:00`).getTime()
           const sinceMs = todayStart - (days - 1) * 24 * 3600 * 1000
-          let records = store.readUsageRecords({ sinceMs, includeTest })
+          const read = store.readUsageRecords({ sinceMs, includeTest })
+          const usageStats = read.stats || { unknown: 0, recovered: 0 }
+          let records = read.records || []
           if (source !== 'all') records = records.filter((r) => r.src === source)
+          // 「历史」= 切换智谱前 / 桥接账本里留下的 DeepSeek 记录；「当前」= 之后用智谱等模型的记录。
+          const eraOf = (r) => (/deepseek/i.test(r.p) || /deepseek/i.test(r.m) ? 'legacy' : 'current')
+          const eraCount = { legacy: { count: 0, tokens: 0 }, current: { count: 0, tokens: 0 } }
+          for (const r of records) {
+            const e = eraCount[eraOf(r)]
+            e.count += 1
+            e.tokens += r.input + r.output
+          }
+          if (era !== 'all') records = records.filter((r) => eraOf(r) === era)
 
           let prices = null
           try {
@@ -1049,6 +1120,10 @@ function apply(ctx) {
               note: '本地统计，非厂商账单',
               days,
               source,
+              era,
+              eraCount,
+              unknown: usageStats.unknown,
+              recovered: usageStats.recovered,
               pricedOk: Boolean(prices && table),
               currency: table?.currency || 'CNY',
               symbol: table?.symbol || '¥',

@@ -19,6 +19,9 @@ const BOX_PORT = 3200
 const ONEBOT_HTTP = 'http://127.0.0.1:3000'
 const STATE_DIR = path.join(ROOT, 'auto-repair', 'state')
 const POLICY_FILE = path.join(STATE_DIR, 'notify-policy.json')
+// 「同一故障重复出现」提醒开关 + 出现次数账本。和上面的总开关互相独立。
+const REPEAT_FILE = path.join(STATE_DIR, 'repeat-alert.json')
+const REPEAT_WINDOW_MS = 30 * 60 * 1000
 const LOG_FILE = path.join(STATE_DIR, 'auto-repair.log')
 
 /**
@@ -40,6 +43,86 @@ function logBlocked(title) {
   try {
     fs.appendFileSync(LOG_FILE, line + '\n', 'utf8')
   } catch {}
+}
+
+// ── 重复故障提醒开关 ────────────────────────────────────────────────────────
+//
+// on（默认）= 维持现状，同一故障反复出现就反复提醒。
+// off       = 同一故障（指纹相同）在窗口内再次出现时不再提醒；首次出现仍然提醒。
+//             修复和 repair-history 记录完全不受影响，只是不弹提醒。
+// 「重复」的判定沿用投喂去重那一套：code + 级别 + 标题 + 现象文本（feedHashOf）。
+
+function readRepeatDoc() {
+  try {
+    const doc = JSON.parse(fs.readFileSync(REPEAT_FILE, 'utf8').replace(/^\uFEFF/, ''))
+    return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeRepeatDoc(doc) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true })
+    const tmp = `${REPEAT_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, REPEAT_FILE)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** on（默认）| off */
+export function readRepeatAlertPolicy() {
+  return readRepeatDoc().mode === 'off' ? 'off' : 'on'
+}
+
+/** 改开关；保留已有的出现次数账本。 */
+export function writeRepeatAlertPolicy(mode) {
+  const next = mode === 'off' ? 'off' : 'on'
+  const doc = readRepeatDoc()
+  const updatedAt = Date.now()
+  const ok = writeRepeatDoc({ ...doc, version: 1, mode: next, updatedAt })
+  return ok ? { ok: true, mode: next, updatedAt } : { ok: false, error: '写 repeat-alert.json 失败' }
+}
+
+/**
+ * 记一次「这个故障又出现了」，返回它是不是重复出现、累计几次。
+ * 账本按指纹保留 7 天，避免无限增长。
+ */
+export function noteFaultOccurrence(hash, now = Date.now()) {
+  if (!hash) return { repeat: false, count: 1 }
+  const doc = readRepeatDoc()
+  const seen = doc.seen && typeof doc.seen === 'object' && !Array.isArray(doc.seen) ? { ...doc.seen } : {}
+  const rec = seen[hash] && typeof seen[hash] === 'object' ? seen[hash] : {}
+  const lastAt = Number(rec.lastAt) || 0
+  const count = (Number(rec.count) || 0) + 1
+  const repeat = lastAt > 0 && now - lastAt <= REPEAT_WINDOW_MS
+  seen[hash] = { firstAt: Number(rec.firstAt) || now, lastAt: now, count }
+  const cutoff = now - 7 * 24 * 3600 * 1000
+  for (const [k, v] of Object.entries(seen)) {
+    if ((Number(v?.lastAt) || 0) < cutoff) delete seen[k]
+  }
+  writeRepeatDoc({ ...doc, version: 1, seen })
+  return { repeat, count }
+}
+
+/** 某个指纹累计出现过几次（面板展示用）。 */
+export function repeatCountOf(hash) {
+  const seen = readRepeatDoc().seen
+  const rec = seen && typeof seen === 'object' ? seen[hash] : null
+  return Number(rec?.count) || 0
+}
+
+/**
+ * 重复提醒闸门：记一次「又出现了」，并判断这次要不要因为
+ * 「确实是重复 + 开关关着」而拦下提醒。
+ * suppress=true 时只拦提醒，不影响调用方继续修复/记录。
+ */
+export function repeatAlertGate(hash, now = Date.now()) {
+  const { repeat, count } = noteFaultOccurrence(hash, now)
+  return { suppress: repeat && readRepeatAlertPolicy() === 'off', repeat, count }
 }
 
 function boxToken() {
