@@ -255,6 +255,33 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #8a8a8a);
   max-height: 160px; overflow-y: auto;
 }
+/* 智谱页：任务队列 */
+.zq-task {
+  margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l1, #ffffff12);
+  background: var(--dsw-alias-bg-layer-2, #ffffff0d);
+}
+.zq-task-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.zq-idx { color: var(--dsw-alias-label-secondary, #8a8a8a); font-size: 11px; }
+.zq-chip {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.zq-chip.pending { color: var(--ar-idle); }
+.zq-chip.running { color: var(--ar-warn); }
+.zq-chip.done { color: var(--ar-ok); }
+.zq-chip.failed { color: var(--ar-fatal); }
+.zq-prompt { margin-top: 4px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.zq-out {
+  margin-top: 5px; padding-left: 8px; font-size: 11px;
+  color: var(--dsw-alias-label-secondary, #8a8a8a);
+  border-left: 2px solid var(--dsw-alias-border-l2, #ffffff1f);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 150px; overflow-y: auto;
+}
+.zq-out.err { color: var(--ar-fatal); border-left-color: var(--ar-fatal); }
+.zq-row-actions { display: flex; gap: 6px; margin-top: 6px; }
+.zq-row-actions .ar-btn { padding: 2px 9px; font-size: 11px; }
 `
 
     function fmtTime(ts) {
@@ -293,6 +320,8 @@ window.__ModuleLoader__.load({
       const [err, setErr] = useState('')
       const [busyCode, setBusyCode] = useState('')
       const [policyBusy, setPolicyBusy] = useState(false)
+      // 自动修复通知策略（总开关）：notify = 照常推送；silent = 只修不推
+      const [notifyBusy, setNotifyBusy] = useState(false)
       const [models, setModels] = useState(null)
       const [modelBusy, setModelBusy] = useState(false)
       // 本机模型客户端（TRAE / MiniMax）：扫描结果 + 手动改路径时的草稿
@@ -304,6 +333,8 @@ window.__ModuleLoader__.load({
       const [providersBusy, setProvidersBusy] = useState(false)
       const [baseDraft, setBaseDraft] = useState({})
       const [keyDraft, setKeyDraft] = useState({})
+      // 智谱模型预设的临时选择（providerId → modelId），点「选为『让 AI 修』模型」才落盘
+      const [presetPick, setPresetPick] = useState({})
       const timerRef = useRef(null)
 
       const load = useCallback(async (silent) => {
@@ -472,6 +503,27 @@ window.__ModuleLoader__.load({
         }
       }, [postJson, load])
 
+      /** 改「自动修复通知策略」总开关（发通知 / 完全不发） */
+      const setNotifyMode = useCallback(async (mode) => {
+        setNotifyBusy(true)
+        setToast(null)
+        try {
+          const r = await postJson('/notify-policy', { mode })
+          if (r && r.ok) {
+            setToast({ ok: true, text: mode === 'silent'
+              ? '已切换为「完全不发」：自动修复照常执行，但不再推送任何对外消息'
+              : '已切换为「发通知」：自动修复的消息会照常推送' })
+          } else {
+            setToast({ ok: false, text: r?.error || '改通知策略失败' })
+          }
+          await load(true)
+        } catch (e) {
+          setToast({ ok: false, text: e?.message || String(e) })
+        } finally {
+          setNotifyBusy(false)
+        }
+      }, [postJson, load])
+
       /** 选「让 AI 修」用哪个模型/提供方（只存 provider/model，不碰任何 Key） */
       const setModel = useCallback(async (provider, model) => {
         setModelBusy(true)
@@ -596,14 +648,24 @@ window.__ModuleLoader__.load({
           ? '全部自动：守护进程发现能修的直接修，不用等你点。'
           : '逐条审批：守护进程只报告不改，等你点某一条的「修复」才动手。'
 
+      // 通知策略：默认 notify（维持现状），只有明确存了 silent 才是「完全不发」
+      const notifyMode = d.notify && d.notify.mode === 'silent' ? 'silent' : 'notify'
+      const notifyHint = notifyMode === 'silent'
+        ? '当前「完全不发」：自动修复照常执行，但需求箱、QQ 私聊、Windows 气泡一条都不推（含全天回复自己发的提示，比如余额不足自动关闭）；修复历史和日志照常记录。'
+        : '当前「发通知」：自动修复的消息和全天回复自己发的提示都照常推送（需求箱 / QQ 私聊 / Windows 气泡），文案与现在一致。'
+
       // 模型卡片用的数据（/models 拉不到时也要能把面板画出来）
       const modelProviders = Array.isArray(models?.providers) ? models.providers : []
       const modelWarnings = Array.isArray(models?.warnings) ? models.warnings : []
       const modelError = models && models.ok === false ? String(models.error || '读不到模型列表') : ''
-      // API 地址 / Key 卡片用的数据
-      const providerList = Array.isArray(providers?.providers) ? providers.providers : []
+      // API 地址 / Key 卡片用的数据（智谱有自己的独立页，不塞在这里）
+      const providerList = (Array.isArray(providers?.providers) ? providers.providers : []).filter((p) => p.id !== 'zhipu')
       const providerError = providers && providers.ok === false ? String(providers.error || '读不到接入信息') : ''
       const curModel = models?.current || null
+      // 智谱预设：模型清单来自 /models 的 zhipu 组（含中文名 / 标签 / 一句说明）
+      const zhipuGroup = modelProviders.find((g) => g.id === 'zhipu') || null
+      const zhipuModels = Array.isArray(zhipuGroup?.models) ? zhipuGroup.models : []
+      const zhipuRoutable = zhipuGroup?.available === true
       // selected 只在用户真的选过时才有值：没选过就停在「跟随 DSH 默认」，
       // 不再默认把 deepseek 那一项顶上去。
       const selected = models?.selected || null
@@ -717,12 +779,36 @@ window.__ModuleLoader__.load({
           )
         ),
 
+        // ── 自动修复通知策略（一个总开关，管所有对外推送） ────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, '通知策略'),
+            h('span', { className: 'ar-policy-hint' }, notifyHint)
+          ),
+          h('div', { className: 'ar-row' },
+            h('div', { className: 'ar-seg' },
+              h('button', {
+                className: `ar-seg-btn ${notifyMode === 'notify' ? 'on' : ''}`,
+                disabled: notifyBusy,
+                onClick: () => setNotifyMode('notify')
+              }, '发通知'),
+              h('button', {
+                className: `ar-seg-btn ${notifyMode === 'silent' ? 'on' : ''}`,
+                disabled: notifyBusy,
+                onClick: () => setNotifyMode('silent')
+              }, '完全不发')
+            )
+          ),
+          h('div', { className: 'ar-policy-hint', style: { marginTop: '8px' } },
+            '这一个总开关同时管自动修复的全部对外消息：待你审批、自动修复成功、自动修复未成功、需要你处理；渠道包括需求箱、QQ 私聊和 Windows 气泡。选「完全不发」时这些一律不推，但修复照常执行，面板的修复历史和 auto-repair.log 仍照常记录。全天回复自己发的提示（例如余额不足自动关闭全天回复）也受这个开关控制：选「完全不发」时同样不推，只在 bridge.log 和面板活动里记录。')
+        ),
+
         // ── AI 模型（「让 AI 修」用哪个提供方/模型） ──────────────────────
         h('div', { className: 'ar-policy' },
           h('div', { className: 'ar-policy-head' },
-            h('span', { className: 'ar-policy-title' }, 'AI 模型'),
+            h('span', { className: 'ar-policy-title' }, '修复使用的模型'),
             h('span', { className: 'ar-policy-hint' },
-              '「让 AI 修」时用哪个提供方/模型。选项来自 DSH 实际可用的模型目录；缺 Key 或路由未启用会直接标出来。')
+              '「让 AI 修」时用哪个提供方/模型（只影响修复用途，不会改队列默认和全天回复）。选项来自 DSH 实际可用的模型目录；缺 Key 或路由未启用会直接标出来。')
           ),
           h('div', { className: 'ar-row' },
             h('select', {
@@ -769,18 +855,35 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ar-policy-head' },
             h('span', { className: 'ar-policy-title' }, 'API 地址与 Key'),
             h('span', { className: 'ar-policy-hint' },
-              '填了就用面板里填的；留空则沿用 DSH 自己的凭据（.credentials.yaml 的 refs 或环境变量）。Key 只写进 DSH 凭据存储，面板只显示尾 4 位。')
+              '智谱的接口地址和模型预设已内置，只需填 Key。填了就用面板里填的；留空则沿用 DSH 自己的凭据（.credentials.yaml 的 refs 或环境变量）。Key 只写进 DSH 凭据存储，面板只显示尾 4 位。')
           ),
           providerError ? h('div', { className: 'ar-warnbox' }, providerError) : null,
           h('div', { className: 'ar-client-list' },
             providerList.map((p) => {
-              const baseVal = baseDraft[p.id] !== undefined ? baseDraft[p.id] : p.baseUrl
+              const isZhipu = p.id === 'zhipu'
+              // 智谱的地址是内置预设：没保存过也直接显示出来，不用用户自己记
+              const baseVal = baseDraft[p.id] !== undefined
+                ? baseDraft[p.id]
+                : (p.baseUrl || (isZhipu ? (p.defaultBaseUrl || '') : ''))
               const keyVal = keyDraft[p.id] || ''
-              const keyState = p.hasKey === true
-                ? (p.keyTail ? `已配置 · 尾号 ${p.keyTail}` : '已配置（来自 DSH 凭据 / 环境变量）')
-                : p.hasKey === false
-                  ? '未配置'
-                  : '读不到状态'
+              const keyState = isZhipu
+                ? p.hasKey === true
+                  ? (zhipuRoutable
+                      ? `Key 已配置${p.keyTail ? ` · 尾号 ${p.keyTail}` : ''}`
+                      : 'Key 已配置 · DSH 路由未挂载')
+                  : p.hasKey === false
+                    ? '缺 Key'
+                    : '缺 Key（读不到凭据状态）'
+                : p.hasKey === true
+                  ? (p.keyTail ? `已配置 · 尾号 ${p.keyTail}` : '已配置（来自 DSH 凭据 / 环境变量）')
+                  : p.hasKey === false
+                    ? '未配置'
+                    : '读不到状态'
+              const presetId = presetPick[p.id] !== undefined
+                ? presetPick[p.id]
+                : (selected?.provider === 'zhipu' ? selected.model : '')
+              const pickId = presetId || (zhipuModels[0]?.id || '')
+              const pickModel = zhipuModels.find((m) => m.id === pickId) || null
               return h('div', { className: 'ar-client-row', key: p.id },
                 h('div', { className: 'ar-client-head' },
                   h('span', { className: 'ar-client-name' }, p.name),
@@ -828,7 +931,40 @@ window.__ModuleLoader__.load({
                     disabled: providersBusy || p.hasKey !== true,
                     onClick: () => saveProvider(p.id, { clearKey: true }, `${p.name}：Key 已清除`)
                   }, '清除')
-                )
+                ),
+                isZhipu
+                  ? h('div', { className: 'ar-preset' },
+                      h('div', { className: 'ar-policy-hint', style: { marginTop: '10px' } },
+                        `模型预设：地址已预填 ${p.defaultBaseUrl || 'https://open.bigmodel.cn/api/paas/v4'}，共 ${zhipuModels.length} 个模型（文本 / 视觉），选一个直接用于「让 AI 修」。`),
+                      p.hasKey !== true
+                        ? h('div', { className: 'ar-warnbox' }, '缺 Key：把 bigmodel.cn 控制台的 API Key 粘到上面点「保存 Key」；填 Key 之前这里不会显示成可用。')
+                        : (zhipuRoutable
+                            ? null
+                            : h('div', { className: 'ar-warnbox' }, 'Key 已配置，但 DSH 里还没挂载智谱 provider（需要改 profile 并重启 DSH 一次）。')),
+                      zhipuModels.length
+                        ? h('div', { className: 'ar-row', style: { marginTop: '6px' } },
+                            h('select', {
+                              className: 'ar-select',
+                              disabled: providersBusy || modelBusy,
+                              value: pickId,
+                              onChange: (e) => setPresetPick((d) => ({ ...d, [p.id]: e.target.value }))
+                            },
+                              zhipuModels.map((m) => h('option', { key: m.id, value: m.id },
+                                `${m.name || m.id}（${m.id}）${m.tag ? ` · ${m.tag}` : ''}`
+                              ))
+                            ),
+                            h('button', {
+                              className: 'ar-btn',
+                              disabled: providersBusy || modelBusy || !pickId,
+                              onClick: () => setModel(p.id, pickId)
+                            }, '选为「让 AI 修」模型')
+                          )
+                        : h('div', { className: 'ar-warnbox' }, '读不到智谱模型预设（/models 接口没返回 zhipu 组）'),
+                      pickModel?.note
+                        ? h('div', { className: 'ar-policy-hint', style: { marginTop: '6px' } }, `适用：${pickModel.note}`)
+                        : null
+                    )
+                  : null
               )
             })
           ),
@@ -1003,6 +1139,874 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ── 智谱开放平台（bigmodel.cn）：独立设置页 ──────────────────────────────
+    // 和「自愈」分开：自己的位置、自己的标题，地址 / Key / 任务队列都在这里。
+    const ZQ_STATUS = {
+      pending: ['pending', '排队中'],
+      running: ['running', '执行中'],
+      done: ['done', '完成'],
+      failed: ['failed', '失败']
+    }
+
+    const VN_STATUS = {
+      ready: ['agent', '已配置'],
+      nokey: ['rejected', '缺 Key'],
+      quota: ['rejected', '额度耗尽'],
+      pending: ['pending', '路由待重启']
+    }
+
+    // 模型列表展开状态：默认收起；放组件外，设置页被重挂载时本次会话内也能记住
+    const VN_OPEN = {}
+
+    // 三种用途各自独立指定：修复（自愈里「让 AI 修」）/ 任务队列默认 / 全天回复
+    const MODEL_USE_LABELS = [
+      ['repair', '修复', '「让 AI 修」用它'],
+      ['queue', '队列默认', '加任务时默认用它'],
+      ['reply', '全天回复', '自动回复用的模型']
+    ]
+
+    // 「重新检测」真发一次最小请求后的判定文案
+    const RECHECK_LABEL = {
+      ok: '可用：刚才那次真实调用返回成功',
+      quota: '额度/余额问题：供应商明确返回欠费或额度不足',
+      nokey: '缺 Key：没读到可用凭据',
+      key: 'Key 无效或无权限（401/403）',
+      error: '调用失败（不是额度问题）',
+      network: '网络不通或超时'
+    }
+
+    function vendorStatus(v) {
+      if (v.quota && v.quota.exhausted) return 'quota'
+      if (!(v.key && v.key.configured)) return 'nokey'
+      if (!v.available) return 'pending'
+      return 'ready'
+    }
+
+    function VendorsSection() {
+      const [state, setState] = useState(null)
+      const [err, setErr] = useState('')
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState('')
+      const [filter, setFilter] = useState('all')
+      const [keyDraft, setKeyDraft] = useState({})
+      const [baseDraft, setBaseDraft] = useState({})
+      const [probe, setProbe] = useState(null)
+      // 「重新检测」的结果（真发一次最小请求）
+      const [recheck, setRecheck] = useState(null)
+      const [qProvider, setQProvider] = useState('')
+      const [qModel, setQModel] = useState('')
+      const [prompt, setPrompt] = useState('')
+      const [showCustom, setShowCustom] = useState(false)
+      const [cName, setCName] = useState('')
+      const [cBase, setCBase] = useState('')
+      const [cModels, setCModels] = useState('')
+      const [cKey, setCKey] = useState('')
+      // 三用途的指定请求各自独立忙态，互不影响
+      const [busyUse, setBusyUse] = useState('')
+      // 每个厂商卡片的模型列表是否展开（默认全收起，状态在本次会话内保持）
+      const [openModels, setOpenModels] = useState(() => ({ ...VN_OPEN }))
+
+      const load = useCallback(async () => {
+        try {
+          const r = await fetchJson('/vendors', { cache: 'no-store' })
+          setState(r)
+          setErr('')
+        } catch (e) {
+          setErr(e?.message || String(e))
+        }
+      }, [])
+
+      useEffect(() => { load() }, [load])
+      useEffect(() => {
+        const t = setInterval(() => { load() }, 8000)
+        return () => clearInterval(t)
+      }, [load])
+
+      async function post(body, tag) {
+        setBusy(tag || 'x')
+        setNote('')
+        try {
+          const r = await fetchJson('/vendors', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body)
+          })
+          if (r && r.ok === false) setErr(String(r.error || '操作失败'))
+          else {
+            setErr('')
+            setNote(String(r.msg || '已更新'))
+            if (r && Array.isArray(r.vendors)) setState(r)
+          }
+          return r
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      function setKey(id, v) { setKeyDraft((d) => ({ ...d, [id]: v })) }
+      function setBase(id, v) { setBaseDraft((d) => ({ ...d, [id]: v })) }
+
+      /** 展开/收起某个厂商的模型列表（默认收起） */
+      function toggleModels(id) {
+        setOpenModels((prev) => {
+          const next = { ...prev, [id]: !prev[id] }
+          if (next[id]) VN_OPEN[id] = true
+          else delete VN_OPEN[id]
+          return next
+        })
+      }
+
+      /** 启用 / 停用一个模型（同一供应商下可以同时启用多个） */
+      async function toggleEnabled(provider, model, on) {
+        const tag = 'en-' + provider + '::' + model
+        setBusy(tag)
+        setNote('')
+        try {
+          const r = await fetchJson('/models', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider, model, enabled: on })
+          })
+          if (r && r.ok === false) setErr(String(r.error || '操作失败'))
+          else {
+            setErr('')
+            setNote(on ? `已启用 ${model}` : `已停用 ${model}`)
+            await load()
+          }
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      /** 指定某个用途用哪个模型；value 为空 = 清空这个用途（修复不允许清空） */
+      async function assignUse(use, value) {
+        if (!value && use === 'repair') {
+          setErr('「修复」用途必须指定一个模型')
+          return
+        }
+        setBusyUse(use)
+        setNote('')
+        try {
+          const i = value.indexOf('::')
+          const body = value
+            ? { use, provider: value.slice(0, i), model: value.slice(i + 2) }
+            : { use, clearUse: true }
+          const r = await fetchJson('/models', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body)
+          })
+          if (r && r.ok === false) setErr(String(r.error || '指定失败'))
+          else {
+            setErr('')
+            const label = (MODEL_USE_LABELS.find((x) => x[0] === use) || ['', use])[1]
+            setNote(value ? `已把「${label}」指定为 ${value.replace('::', ' / ')}` : `已清空「${label}」的指定`)
+            await load()
+          }
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setBusyUse('')
+        }
+      }
+
+      const vendorUses = (state && state.uses) || {}
+      const enabledList = Array.isArray(state && state.enabled) ? state.enabled : []
+      const enabledKeys = new Set(enabledList.map((x) => `${x.provider}::${x.model}`))
+      const vendorsAll = Array.isArray(state && state.vendors) ? state.vendors : []
+      const enabledOptions = []
+      for (const v of vendorsAll) {
+        for (const m of v.models || []) {
+          const k = `${v.id}::${m.id}`
+          if (enabledKeys.has(k)) enabledOptions.push({ key: k, label: `${v.name} / ${m.name || m.id}` })
+        }
+      }
+
+      const vendors = Array.isArray(state && state.vendors) ? state.vendors : []
+      const models = vendors.reduce((n, v) => n + (v.models ? v.models.length : 0), 0)
+      const counts = { ready: 0, nokey: 0, quota: 0, pending: 0 }
+      for (const v of vendors) counts[vendorStatus(v)] += 1
+      const shown = vendors.filter((v) => {
+        const st = vendorStatus(v)
+        if (filter === 'all') return true
+        if (filter === 'custom') return v.isCustom
+        return st === filter
+      })
+
+      const q = (state && state.queue) || { running: false, tasks: [] }
+      const tasks = Array.isArray(q.tasks) ? q.tasks : []
+      // 「队列默认」这个用途优先作为初始供应商/模型，用户手动改了就按手动的来
+      const qDefaultPair = vendorUses.queue
+      const qProviderValue = qProvider
+        || (qDefaultPair && vendors.some((v) => v.id === qDefaultPair.provider) ? qDefaultPair.provider : '')
+      const qVendor = vendors.find((v) => v.id === qProviderValue) || vendors.find((v) => v.id === 'zhipu') || vendors[0]
+      const qModels = (qVendor && qVendor.models) || []
+      const qDefaultModel = qDefaultPair && qVendor && qDefaultPair.provider === qVendor.id ? qDefaultPair.model : ''
+      const qModelValue = qModels.some((m) => m.id === qModel)
+        ? qModel
+        : (qModels.some((m) => m.id === qDefaultModel) ? qDefaultModel : (qModels[0]?.id || ''))
+
+      const sourceLabel = (s) => ({
+        file: 'DSH 凭据文件',
+        env: '环境变量',
+        store: 'DSH 凭据存储',
+        resolve: 'DSH 凭据（运行时）'
+      }[s] || 'DSH 凭据')
+
+      return h('div', { className: 'ar-root' },
+        h('style', null, STYLE),
+        h('style', null, `
+          .vn-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 4px}
+          .vn-tab{border:1px solid rgba(127,127,127,.25);background:transparent;color:inherit;border-radius:999px;padding:4px 12px;font-size:12px;cursor:pointer}
+          .vn-tab.on{background:rgba(64,132,255,.14);border-color:rgba(64,132,255,.5)}
+          .vn-grid{display:flex;flex-direction:column;gap:10px;margin-top:8px}
+          .vn-card{border:1px solid rgba(127,127,127,.18);border-radius:10px;padding:12px}
+          .vn-card.route-down{opacity:.86}
+          .vn-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+          .vn-name{font-weight:600;font-size:14px}
+          .vn-badge{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid rgba(127,127,127,.3);opacity:.85}
+          .vn-note{font-size:12px;opacity:.72;margin-top:4px;line-height:1.55}
+          .vn-models{margin-top:6px;display:flex;flex-direction:column;gap:4px}
+          .vn-models-toggle{margin-top:8px}
+          .vn-toggle-btn{border:1px solid rgba(127,127,127,.25);background:transparent;color:inherit;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;opacity:.85}
+          .vn-toggle-btn:hover{opacity:1;border-color:rgba(64,132,255,.5)}
+          .vn-setrepair{font-size:11px;padding:1px 8px;border-radius:999px}
+          .vn-model{display:flex;align-items:center;gap:8px;font-size:12px;flex-wrap:wrap}
+          .vn-mname{font-weight:550}
+          .vn-mid{opacity:.5;font-family:ui-monospace,Consolas,monospace;font-size:11px}
+          .vn-mnote{opacity:.7}
+          .vn-price{opacity:.62;font-size:11px}
+          .vn-keyrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:10px}
+          .vn-keyrow .ar-input{flex:1;min-width:180px}
+          .vn-keyline{margin-top:6px}
+          .vn-addrline{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px}
+          .vn-addrline .ar-input{flex:1;min-width:200px}
+          .vn-model.off{opacity:.55}
+          .vn-check{display:inline-flex;align-items:center;gap:4px;font-size:11px;opacity:.9;cursor:pointer}
+          .vn-use{font-size:10px;padding:0 5px;border-radius:999px;border:1px solid rgba(127,127,127,.3);opacity:.75}
+          .vn-use.on{border-color:rgba(64,132,255,.55);opacity:1;background:rgba(64,132,255,.12)}
+          .vn-use-none{font-size:10px;opacity:.5}
+          .vn-addr{margin-top:8px}
+          .vn-addr summary{cursor:pointer;font-size:12px;opacity:.65}
+          .vn-addr .ar-row{margin-top:8px}
+          .vn-empty{padding:18px;text-align:center;opacity:.6;font-size:13px}
+        `),
+
+        h('div', { className: 'ar-head' },
+          h('span', { className: 'ar-dot ' + (counts.ready ? 'ok' : 'warn') }),
+          h('div', { className: 'ar-head-main' },
+            h('div', { className: 'ar-title' }, '模型供应商'),
+            h('div', { className: 'ar-sub' }, '主流厂商预设 + 自定义入口 · Key / 额度 / 路由状态都照实显示')
+          ),
+          h('div', { className: 'ar-head-right' }, h('span', { className: 'ar-maker' }, MAKER))
+        ),
+
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '总览'),
+            h('span', { className: 'ar-flag agent' }, `已配置 ${counts.ready}`),
+            h('span', { className: 'ar-flag rejected' }, `缺 Key ${counts.nokey}`),
+            counts.quota ? h('span', { className: 'ar-flag rejected' }, `额度耗尽 ${counts.quota}`) : null,
+            counts.pending ? h('span', { className: 'ar-flag pending' }, `待重启 ${counts.pending}`) : null,
+            h('span', { className: 'ar-flag' }, `${vendors.length} 家 / ${models} 个模型`)
+          ),
+          h('div', { className: 'ar-policy-hint' },
+            '「已配置」= Key 已读到，且路由已经在当前 DSH 进程里加载。',
+            '填了新 Key 不需要重启；新增厂商、改地址需要重启一次 DSH 才会进模型列表。'
+          ),
+          state && state.routeNeeded
+            ? h('div', { className: 'ar-warnbox' },
+              '有供应商的路由还没在当前进程生效。把所有 Key 填好后重启一次 DSH 即可批量生效，不用一家一家重启。')
+            : null,
+          h('div', { className: 'vn-tabs' },
+            [['all', '全部'], ['ready', '已配置'], ['nokey', '缺 Key'], ['quota', '额度耗尽'], ['custom', '自定义']]
+              .map(([k, label]) => h('button', {
+                key: k,
+                className: 'vn-tab' + (filter === k ? ' on' : ''),
+                onClick: () => setFilter(k)
+              }, label))
+          )
+        ),
+
+        // ── 三种用途各自独立指定（修复 / 队列默认 / 全天回复） ────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '模型用途'),
+            h('span', { className: 'ar-flag' }, `已启用 ${enabledOptions.length} 个模型`)
+          ),
+          h('div', { className: 'ar-policy-hint' },
+            '三处指定互相独立，改一个不会覆盖另外两个。',
+            '先在下面各厂商卡片里勾选「启用」（一家可以同时启用多个），再在这里分别指定用途；同一个模型可以被多处共用。'
+          ),
+          enabledOptions.length === 0
+            ? h('div', { className: 'ar-warnbox' }, '还没有启用任何模型：在下面卡片里勾选模型左侧的「启用」后，这里就能选了。')
+            : MODEL_USE_LABELS.map(([k, label, desc]) => {
+              const cur = vendorUses[k]
+              const curVal = cur ? `${cur.provider}::${cur.model}` : ''
+              const curInList = curVal && enabledOptions.some((o) => o.key === curVal)
+              return h('div', { className: 'ar-row', key: k },
+                h('span', { className: 'ar-sub' }, label),
+                h('select', {
+                  className: 'ar-select',
+                  value: curVal,
+                  disabled: busyUse === k,
+                  onChange: (e) => assignUse(k, String(e.target.value || ''))
+                },
+                  k !== 'repair' ? h('option', { value: '' }, cur ? '（未指定，清空）' : '（未指定）') : null,
+                  !cur && k === 'repair' ? h('option', { value: '' }, '（未指定，请选一个）') : null,
+                  curVal && !curInList ? h('option', { value: curVal }, `${cur.provider} / ${cur.model}（当前，不在已启用列表）`) : null,
+                  enabledOptions.map((o) => h('option', { key: o.key, value: o.key }, o.label))
+                ),
+                h('span', { className: 'ar-sub' }, desc)
+              )
+            })
+        ),
+
+        h('div', { className: 'vn-grid' },
+          shown.length === 0
+            ? h('div', { className: 'vn-empty' }, '这个筛选下没有供应商。')
+            : shown.map((v) => {
+              const st = vendorStatus(v)
+              const pair = VN_STATUS[st]
+              const kd = keyDraft[v.id] || ''
+              const bd = baseDraft[v.id] !== undefined ? baseDraft[v.id] : (v.baseUrl || '')
+              return h('div', { className: 'vn-card' + (v.available ? '' : ' route-down'), key: v.id },
+                h('div', { className: 'vn-top' },
+                  h('span', { className: 'vn-name' }, v.name),
+                  h('span', { className: 'ar-flag ' + pair[0] }, pair[1]),
+                  v.isCustom ? h('span', { className: 'vn-badge' }, '自定义') : null,
+                  v.verified === false ? h('span', { className: 'vn-badge' }, '待确认') : null,
+                  v.docs ? h('a', { className: 'ar-sub', href: v.docs, target: '_blank', rel: 'noreferrer' }, '官方文档') : null,
+                  h('span', { className: 'ar-sub' }, v.keyEnv || '')
+                ),
+                // Key 状态 + 输入行紧跟标题：打开卡片就能直接填
+                v.key && v.key.configured
+                  ? h('div', { className: 'ar-sub vn-keyline' }, `Key 已配置 · 尾号 ${v.key.keyTail || '----'} · 来源：${sourceLabel(v.key.source)}`)
+                  : h('div', { className: 'ar-sub vn-keyline' }, `缺 Key${v.keyEnv ? `（${v.keyEnv}）` : ''}`),
+                h('div', { className: 'vn-keyrow' },
+                  h('input', {
+                    className: 'ar-input',
+                    type: 'password',
+                    spellCheck: false,
+                    value: kd,
+                    placeholder: v.key && v.key.configured ? `已配置（尾号 ${v.key.keyTail || '----'}），留空不改` : `粘贴 ${v.keyEnv || 'API Key'}`,
+                    onChange: (e) => setKey(v.id, e.target.value)
+                  }),
+                  h('button', {
+                    className: 'ar-btn primary',
+                    disabled: busy === 'key-' + v.id || !kd.trim(),
+                    onClick: async () => {
+                      const r = await post({ id: v.id, apiKey: kd }, 'key-' + v.id)
+                      if (r && r.ok !== false) setKey(v.id, '')
+                    }
+                  }, busy === 'key-' + v.id ? '保存中…' : '保存 Key'),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: busy === 'clear-' + v.id || !(v.key && v.key.configured),
+                    onClick: async () => { await post({ id: v.id, clearKey: true }, 'clear-' + v.id) }
+                  }, '清除')
+                ),
+                // 地址与连通性探测也放在最上面，不用先点开折叠
+                h('div', { className: 'vn-addrline' },
+                  h('span', { className: 'ar-sub' }, '地址'),
+                  h('input', {
+                    className: 'ar-input',
+                    value: bd,
+                    spellCheck: false,
+                    onChange: (e) => setBase(v.id, e.target.value)
+                  }),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: busy === 'base-' + v.id,
+                    onClick: async () => {
+                      const r = await post({ id: v.id, baseUrl: bd }, 'base-' + v.id)
+                      if (r && r.ok !== false) setBase(v.id, undefined)
+                    }
+                  }, busy === 'base-' + v.id ? '保存中…' : '保存地址'),
+                  h('button', {
+                    className: 'ar-btn',
+                    disabled: busy === 'probe-' + v.id,
+                    onClick: async () => {
+                      const r = await post({ id: v.id, probe: true }, 'probe-' + v.id)
+                      if (r && r.probe) setProbe({ id: v.id, text: JSON.stringify(r.probe).slice(0, 260) })
+                    }
+                  }, busy === 'probe-' + v.id ? '探测中…' : '测试连通'),
+                  h('button', {
+                    className: 'ar-btn',
+                    title: '真发一次最小请求，判断 Key / 额度到底能不能用',
+                    disabled: busy === 'recheck-' + v.id,
+                    onClick: async () => {
+                      const r = await post({ id: v.id, recheck: true }, 'recheck-' + v.id)
+                      if (r && r.recheck) {
+                        setRecheck({
+                          id: v.id,
+                          kind: r.recheck.kind || '',
+                          text: r.recheck.message || RECHECK_LABEL[r.recheck.kind] || ''
+                        })
+                      }
+                    }
+                  }, busy === 'recheck-' + v.id ? '检测中…' : '重新检测'),
+                  v.isCustom ? h('button', {
+                    className: 'ar-btn',
+                    disabled: busy === 'rm-' + v.id,
+                    onClick: async () => {
+                      if (!window.confirm(`删除自定义供应商「${v.name}」？`)) return
+                      await post({ id: v.id, customAction: 'remove' }, 'rm-' + v.id)
+                    }
+                  }, '删除') : null
+                ),
+                probe && probe.id === v.id ? h('div', { className: 'ar-note' }, '探测结果：' + probe.text) : null,
+                recheck && recheck.id === v.id
+                  ? h('div', { className: 'ar-note' }, '重新检测：' + recheck.text)
+                  : null,
+                // 只有「明确失败、且之后没有成功证据」才挂这个提示；成功一次就自动消失
+                v.quota && v.quota.exhausted
+                  ? h('div', { className: 'ar-warnbox' },
+                    `上次调用报额度问题：${v.quota.message || '供应商返回余额不足'}（${fmtDateTime(v.quota.at)}）。之后只要有一次真实调用成功就会自动清掉；也可以点「重新检测」马上重试一次。`)
+                  : null,
+                v.note ? h('div', { className: 'vn-note' }, v.note) : null,
+                // 模型列表默认收起：卡片只留一行「N 个模型」，点开才看到勾选/用途徽标/设为修复模型
+                (v.models || []).length
+                  ? h('div', { className: 'vn-models-toggle' },
+                    h('button', {
+                      className: 'vn-toggle-btn',
+                      onClick: () => toggleModels(v.id),
+                      title: openModels[v.id] ? '收起模型列表' : '展开模型列表'
+                    },
+                      openModels[v.id] ? '▾' : '▸',
+                      ` ${(v.models || []).length} 个模型`,
+                      openModels[v.id] ? '（收起）' : '（展开）'
+                    )
+                  )
+                  : null,
+                openModels[v.id]
+                  ? h('div', { className: 'vn-models' },
+                    (v.models || []).map((m) => {
+                      const mk = `${v.id}::${m.id}`
+                      const isOn = enabledKeys.has(mk)
+                      const isRepair = Boolean(vendorUses.repair && `${vendorUses.repair.provider}::${vendorUses.repair.model}` === mk)
+                      const usedLabels = MODEL_USE_LABELS
+                        .filter(([k]) => vendorUses[k] && `${vendorUses[k].provider}::${vendorUses[k].model}` === mk)
+                        .map(([, label]) => label)
+                      return h('div', { className: 'vn-model' + (isOn ? '' : ' off'), key: m.id },
+                        h('label', { className: 'vn-check', title: '启用后可用于「修复 / 队列默认 / 全天回复」' },
+                          h('input', {
+                            type: 'checkbox',
+                            checked: isOn,
+                            disabled: busy === 'en-' + mk,
+                            onChange: (e) => toggleEnabled(v.id, m.id, e.target.checked)
+                          }),
+                          '启用'
+                        ),
+                        h('span', { className: 'vn-mname' }, m.name || m.id),
+                        h('span', { className: 'vn-mid' }, m.id),
+                        usedLabels.length
+                          ? usedLabels.map((label) => h('span', { className: 'vn-use on', key: label }, label))
+                          : (isOn ? h('span', { className: 'vn-use-none' }, '已启用 · 未分配') : null),
+                        m.note ? h('span', { className: 'vn-mnote' }, m.note) : null,
+                        m.price ? h('span', { className: 'vn-price' }, m.price) : null,
+                        m.verified === false ? h('span', { className: 'vn-badge' }, '待确认') : null,
+                        h('button', {
+                          className: 'ar-btn vn-setrepair',
+                          disabled: busyUse === 'repair',
+                          title: '把这个模型指定为「让 AI 修」使用的模型',
+                          onClick: () => assignUse('repair', mk)
+                        }, isRepair ? '当前修复模型' : '设为修复模型')
+                      )
+                    })
+                  )
+                  : null
+              )
+            })
+        ),
+
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '自定义供应商'),
+            h('span', { className: 'ar-flag' }, '名称 / 地址 / 模型 ID / Key')
+          ),
+          h('div', { className: 'ar-policy-hint' },
+            '任何 OpenAI 兼容服务都能接：填完会进同一个模型列表、同一个队列，路由随下一次重启生效。',
+            '模型 ID 可以填多个，用逗号或换行分隔。'
+          ),
+          h('div', { className: 'ar-actions' },
+            h('button', { className: 'ar-btn', onClick: () => setShowCustom((x) => !x) }, showCustom ? '收起' : '新增自定义供应商')
+          ),
+          showCustom
+            ? h('div', null,
+              h('div', { className: 'ar-row' },
+                h('span', { className: 'ar-sub' }, '名称'),
+                h('input', { className: 'ar-input', value: cName, placeholder: '例如：公司内网网关', onChange: (e) => setCName(e.target.value) })
+              ),
+              h('div', { className: 'ar-row' },
+                h('span', { className: 'ar-sub' }, '地址'),
+                h('input', { className: 'ar-input', value: cBase, spellCheck: false, placeholder: 'https://example.com/v1', onChange: (e) => setCBase(e.target.value) })
+              ),
+              h('div', { className: 'ar-row' },
+                h('span', { className: 'ar-sub' }, '模型 ID'),
+                h('input', { className: 'ar-input', value: cModels, spellCheck: false, placeholder: 'model-a, model-b', onChange: (e) => setCModels(e.target.value) })
+              ),
+              h('div', { className: 'ar-row' },
+                h('span', { className: 'ar-sub' }, 'Key'),
+                h('input', { className: 'ar-input', type: 'password', value: cKey, spellCheck: false, placeholder: '可留空，稍后再填', onChange: (e) => setCKey(e.target.value) })
+              ),
+              h('div', { className: 'ar-actions' },
+                h('button', {
+                  className: 'ar-btn primary',
+                  disabled: busy === 'custom-add' || !cName.trim() || !cBase.trim() || !cModels.trim(),
+                  onClick: async () => {
+                    const list = cModels.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean)
+                    const r = await post({ customAction: 'add', name: cName, baseUrl: cBase, models: list, apiKey: cKey }, 'custom-add')
+                    if (r && r.ok !== false) {
+                      setCName(''); setCBase(''); setCModels(''); setCKey(''); setShowCustom(false)
+                    }
+                  }
+                }, busy === 'custom-add' ? '保存中…' : '保存自定义供应商')
+              )
+            )
+            : null
+        ),
+
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '任务队列（共用）'),
+            h('span', { className: 'ar-flag' }, q.running ? '执行中' : '空闲'),
+            h('span', { className: 'ar-flag' }, `共 ${tasks.length} 条`)
+          ),
+          h('div', { className: 'ar-policy-hint' },
+            '队列不分厂商：选哪家就用哪家的地址和 Key，串行执行、可重试，状态写在 auto-repair/state/zhipu-queue.json。'
+          ),
+          h('div', { className: 'ar-row' },
+            h('span', { className: 'ar-sub' }, '供应商'),
+            h('select', {
+              className: 'ar-select',
+              value: qVendor ? qVendor.id : '',
+              onChange: (e) => { setQProvider(e.target.value); setQModel('') }
+            },
+              vendors.map((v) => h('option', { key: v.id, value: v.id }, `${v.name}${v.key && v.key.configured ? '' : '（缺 Key）'}`))
+            )
+          ),
+          h('div', { className: 'ar-row' },
+            h('span', { className: 'ar-sub' }, '模型'),
+            h('select', {
+              className: 'ar-select',
+              value: qModelValue,
+              onChange: (e) => setQModel(e.target.value)
+            },
+              qModels.length
+                ? qModels.map((m) => h('option', { key: m.id, value: m.id }, `${m.name || m.id}（${m.id}）`))
+                : h('option', { value: '' }, '暂无模型')
+            )
+          ),
+          h('textarea', {
+            className: 'ar-input',
+            rows: 3,
+            value: prompt,
+            placeholder: '要交给这个供应商做的事，例如：把这段日志总结成三条结论…',
+            onChange: (e) => setPrompt(e.target.value)
+          }),
+          h('div', { className: 'ar-actions' },
+            h('button', {
+              className: 'ar-btn primary',
+              disabled: busy === 'q-add' || !prompt.trim() || !qVendor || !qModelValue,
+              onClick: async () => {
+                const r = await post({ id: qVendor.id, action: 'add', prompt, model: qModelValue }, 'q-add')
+                if (r && r.ok !== false) setPrompt('')
+              }
+            }, '加入队列'),
+            h('button', {
+              className: 'ar-btn',
+              disabled: busy === 'retryall',
+              onClick: () => post({ id: qVendor ? qVendor.id : '', action: 'retry-all' }, 'retryall')
+            }, '重试全部失败'),
+            h('button', {
+              className: 'ar-btn',
+              disabled: busy === 'clearq',
+              onClick: () => post({ id: qVendor ? qVendor.id : '', action: 'clear-finished' }, 'clearq')
+            }, '清理已完成')
+          ),
+          tasks.length === 0
+            ? h('div', { className: 'ar-empty' }, '队列是空的。加一条任务，它会自动开始执行。')
+            : h('div', null, tasks.map((t, i) => {
+              const pair = ZQ_STATUS[t.status] || ['pending', t.status || '未知']
+              const pv = vendors.find((v) => v.id === (t.provider || 'zhipu'))
+              return h('div', { className: 'zq-task', key: t.id },
+                h('div', { className: 'zq-task-top' },
+                  h('span', { className: 'zq-idx' }, `#${i + 1}`),
+                  h('span', { className: 'zq-chip ' + pair[0] }, pair[1]),
+                  h('span', { className: 'ar-sub' }, pv ? pv.name : (t.provider || 'zhipu')),
+                  h('span', { className: 'ar-sub' }, t.model || '(默认模型)'),
+                  t.attempts > 1 ? h('span', { className: 'ar-sub' }, `第 ${t.attempts} 次`) : null,
+                  h('span', { className: 'ar-time' },
+                    t.finishedAt ? fmtDateTime(t.finishedAt)
+                      : t.startedAt ? '开始 ' + fmtTime(t.startedAt)
+                        : fmtTime(t.createdAt))
+                ),
+                h('div', { className: 'zq-prompt' }, t.prompt),
+                t.result ? h('div', { className: 'zq-out' }, t.result) : null,
+                t.error ? h('div', { className: 'zq-out err' }, t.error) : null,
+                h('div', { className: 'zq-row-actions' },
+                  t.status === 'failed'
+                    ? h('button', {
+                      className: 'ar-btn',
+                      disabled: busy === 'retry-' + t.id,
+                      onClick: () => post({ id: t.provider || 'zhipu', action: 'retry', taskId: t.id }, 'retry-' + t.id)
+                    }, '重试')
+                    : null,
+                  (t.status === 'done' || t.status === 'failed')
+                    ? h('button', {
+                      className: 'ar-btn',
+                      disabled: busy === 'rm-' + t.id,
+                      onClick: () => post({ id: t.provider || 'zhipu', action: 'remove', taskId: t.id }, 'rm-' + t.id)
+                    }, '删除')
+                    : null
+                )
+              )
+            }))
+        ),
+
+        err ? h('div', { className: 'ar-warnbox' }, err) : null,
+        note ? h('div', { className: 'ar-note' }, note) : null
+      )
+    }
+
+    // ── 模型管理（总控）：一处切换 API + 接管范围清单 ─────────────────────────
+    const MANAGE_SCOPE_ROWS = [
+      { key: 'agent', label: 'DSH 本体会话', hint: 'agent-default-model（profiles/desktop/cordis.patch.yml）', effect: '需重启 DSH', effectNote: '' },
+      { key: 'repair', label: '自愈「让 AI 修」', hint: 'model-choice.json', effect: '即时', effectNote: '守护进程每次运行读文件' },
+      { key: 'queue', label: '任务队列默认模型', hint: 'uses.queue', effect: '即时', effectNote: '只影响新任务' },
+      { key: 'reply', label: '全天回复 / QQ 桥接', hint: 'uses.reply', effect: '即时', effectNote: '每条消息热读，无需重启' },
+      { key: 'bridge', label: '桥接兜底配置', hint: 'qq-bridge/config.json 的 dsh.provider/model', effect: '需重启桥接', effectNote: 'reply 为空时才用到' }
+    ]
+
+    function ManageSection() {
+      const [state, setState] = useState(null)
+      const [err, setErr] = useState('')
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState('')
+      const [pv, setPv] = useState('')
+      const [mv, setMv] = useState('')
+      const [results, setResults] = useState(null)
+
+      const load = useCallback(async () => {
+        try {
+          const r = await fetchJson('/manage', { cache: 'no-store' })
+          setState(r)
+          setErr('')
+        } catch (e) {
+          setErr(e?.message || String(e))
+        }
+      }, [])
+      useEffect(() => { load() }, [load])
+      useEffect(() => {
+        const t = setInterval(() => { load() }, 8000)
+        return () => clearInterval(t)
+      }, [load])
+
+      async function send(body, tag) {
+        setBusy(tag || 'x')
+        setNote('')
+        setErr('')
+        try {
+          const r = await fetchJson('/manage', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body)
+          })
+          if (r) {
+            if (r.ok === false) setErr(String(r.error || '操作失败'))
+            if (Array.isArray(r.results)) setResults(r.results)
+            if (r.message) setNote(String(r.message))
+            if (Array.isArray(r.vendors)) setState(r)
+          }
+          return r
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      const vendors = (state && state.vendors) || []
+      const takeover = (state && state.takeover) || {}
+      const defProvider =
+        (state && (state.uses?.reply?.provider || state.uses?.queue?.provider)) ||
+        (vendors.find((v) => v.configured) || {}).id ||
+        ''
+      const defModel = (state && (state.uses?.reply?.model || state.uses?.queue?.model)) || ''
+      const selProvider = pv || defProvider
+      const selVendor = vendors.find((v) => v.id === selProvider) || null
+      const selModels = (selVendor && selVendor.models) || []
+      const selModel = (mv && selModels.some((m) => m.id === mv) ? mv : '') ||
+        (selModels.some((m) => m.id === defModel) ? defModel : '') ||
+        (selModels[0] && selModels[0].id) || ''
+
+      const valueOf = (key) => {
+        if (!state) return '—'
+        if (key === 'agent') {
+          const a = state.agent || {}
+          return a.exists ? `${a.provider || '?'} / ${a.model || '?'}` : '读不到（profile 缺失）'
+        }
+        if (key === 'repair') return state.repair ? `${state.repair.provider} / ${state.repair.model}` : '（未指定）'
+        if (key === 'bridge') return `${state.bridge?.provider || '?'} / ${state.bridge?.model || '?'}`
+        const u = (state.uses && state.uses[key]) || null
+        return u ? `${u.provider} / ${u.model}` : '（未指定）'
+      }
+
+      function toggleScope(key, on) {
+        const next = { ...takeover, [key]: on }
+        setState((s) => (s ? { ...s, takeover: next } : s))
+        send({ action: 'saveTakeover', takeover: next }, 'tk-' + key)
+      }
+
+      function doSwitch() {
+        if (!selProvider || !selModel) return
+        const scopes = MANAGE_SCOPE_ROWS.filter((r) => takeover[r.key]).map((r) => r.key)
+        if (!scopes.length) {
+          setErr('下面没有任何一项被接管，先把要跟着变的那几项打开')
+          return
+        }
+        setResults(null)
+        send({ action: 'switch', provider: selProvider, model: selModel, scopes }, 'switch')
+      }
+
+      function applyAgent() {
+        if (!selProvider || !selModel) return
+        send({ action: 'applyAgent', provider: selProvider, model: selModel }, 'agent')
+      }
+
+      const restartList = (results || []).filter((r) => r.needsRestart)
+      const pending = state && state.pendingAgent
+
+      return h('div', { className: 'ar-root' },
+        h('style', null, STYLE + `
+          .mg-sec{margin-top:14px}
+          .mg-tag{font-size:11px;opacity:.8}
+          .mg-chk{display:flex;align-items:center;gap:5px;font-size:11.5px;opacity:.92;white-space:nowrap}
+          .mg-res{margin-top:8px;font-size:12px;line-height:1.6}
+          .mg-scopes{display:flex;flex-direction:column;gap:10px;margin-top:4px}
+          .mg-scope{display:flex;flex-direction:column;gap:6px;min-width:0;padding:10px 12px;border:1px solid rgba(127,127,127,.18);border-radius:10px;background:rgba(127,127,127,.04)}
+          .mg-scope-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;min-width:0}
+          .mg-scope-name{font-weight:600;font-size:12.5px;min-width:0;overflow-wrap:anywhere}
+          .mg-scope-key{font-family:ui-monospace,Consolas,monospace;font-size:11px;opacity:.62;overflow-wrap:anywhere;word-break:break-all}
+          .mg-scope-val{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;font-size:11.5px;min-width:0}
+          .mg-now,.mg-next{font-family:ui-monospace,Consolas,monospace;white-space:nowrap;max-width:100%}
+          .mg-now{opacity:.9}
+          .mg-nextgroup{display:inline-flex;align-items:baseline;gap:6px;white-space:nowrap;max-width:100%}
+          .mg-arrow{opacity:.5}
+          .mg-next{opacity:.95}
+          .mg-next.off{opacity:.5}
+          .mg-scope-foot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0}
+          .mg-badge{font-size:11px;line-height:1.5;padding:1px 8px;border-radius:999px;border:1px solid rgba(127,127,127,.3);background:rgba(127,127,127,.1);white-space:normal;overflow-wrap:anywhere}
+          .mg-badge.restart{border-color:rgba(214,158,46,.55);background:rgba(214,158,46,.14)}
+          .mg-badge-note{font-size:11px;opacity:.62;white-space:normal;overflow-wrap:anywhere}
+        `),
+        h('div', { className: 'ar-section-title' }, '模型管理'),
+        h('div', { className: 'ar-note' }, '一处切换当前生效的厂商/模型；下面每一项单独决定「跟不跟着变」，并标明是即时生效还是必须重启。'),
+
+        err ? h('div', { className: 'ar-warnbox' }, err) : null,
+        note ? h('div', { className: 'ar-note' }, note) : null,
+        restartList.length
+          ? h('div', { className: 'ar-warnbox' }, '其中 ' + restartList.map((r) => (MANAGE_SCOPE_ROWS.find((x) => x.key === r.scope) || {}).label || r.scope).join('、') + ' 需重启才生效。')
+          : null,
+
+        // ① 切换 API
+        h('div', { className: 'ar-card mg-sec' },
+          h('div', { className: 'ar-section-title' }, '切换 API'),
+          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+            h('select', {
+              value: selProvider,
+              onChange: (e) => { setPv(e.target.value); setMv('') },
+              style: { minWidth: 190 }
+            },
+              !vendors.length ? h('option', { value: '' }, '（加载中）') : null,
+              vendors.map((v) => h('option', { key: v.id, value: v.id },
+                `${v.name || v.id}${v.configured ? '' : '（缺 Key）'}`))
+            ),
+            h('select', {
+              value: selModel,
+              onChange: (e) => setMv(e.target.value),
+              style: { minWidth: 220 }
+            },
+              selModels.map((m) => h('option', { key: m.id, value: m.id }, `${m.name || m.id}（${m.id}）`))
+            ),
+            h('span', { className: 'mg-tag' },
+              selVendor
+                ? (selVendor.configured ? 'Key 已配置' : (selVendor.keyEnv ? '缺 Key，先用「模型供应商」填上' : '免 Key'))
+                : ''
+            ),
+            h('button', {
+              className: 'ar-btn',
+              disabled: busy === 'switch' || !selProvider || !selModel,
+              onClick: doSwitch
+            }, busy === 'switch' ? '切换中…' : '切换')
+          ),
+          h('div', { className: 'ar-note' }, '只作用于下面勾了「接管」的项；没勾的不会被动。'),
+          pending
+            ? h('div', { className: 'ar-note' }, `DSH 本体待应用：${pending.provider} / ${pending.model}（点下方「写入 DSH 本体」并重启）`)
+            : null,
+          results && results.length
+            ? h('div', { className: 'mg-res' },
+              results.map((r) => {
+                const row = MANAGE_SCOPE_ROWS.find((x) => x.key === r.scope) || {}
+                return h('div', { key: r.scope },
+                  `${r.ok ? '✓' : '✗'} ${row.label || r.scope}：${r.message || (r.ok ? '成功' : '失败')}${r.needsRestart ? '（需重启）' : ''}`)
+              })
+            )
+            : null
+        ),
+
+        // ② 接管范围（堆叠卡片：一项一块，窄容器下纵向排列，不横向挤出）
+        h('div', { className: 'ar-card mg-sec' },
+          h('div', { className: 'ar-section-title' }, '接管范围'),
+          h('div', { className: 'mg-scopes' },
+            MANAGE_SCOPE_ROWS.map((row) =>
+              h('div', { className: 'mg-scope', key: row.key },
+                h('div', { className: 'mg-scope-head' },
+                  h('div', { className: 'mg-scope-name' }, row.label),
+                  h('label', { className: 'mg-chk' },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: Boolean(takeover[row.key]),
+                      disabled: busy === 'tk-' + row.key,
+                      onChange: (e) => toggleScope(row.key, e.target.checked)
+                    }),
+                    '接管'
+                  )
+                ),
+                h('div', { className: 'mg-scope-key' }, row.hint),
+                h('div', { className: 'mg-scope-val' },
+                  h('span', { className: 'mg-now' }, valueOf(row.key)),
+                  h('span', { className: 'mg-nextgroup' },
+                    h('span', { className: 'mg-arrow' }, '→'),
+                    h('span', { className: takeover[row.key] ? 'mg-next' : 'mg-next off' },
+                      takeover[row.key] ? `${selProvider} / ${selModel}` : '保持不动')
+                  )
+                ),
+                h('div', { className: 'mg-scope-foot' },
+                  h('span', { className: row.effect === '即时' ? 'mg-badge' : 'mg-badge restart' }, row.effect),
+                  row.effectNote ? h('span', { className: 'mg-badge-note' }, row.effectNote) : null,
+                  row.key === 'agent'
+                    ? h('button', {
+                      className: 'ar-btn',
+                      disabled: busy === 'agent' || !selProvider || !selModel,
+                      title: '写入 profiles/desktop/cordis.patch.yml 的 agent-default-model（改前自动备份）',
+                      onClick: applyAgent
+                    }, busy === 'agent' ? '写入中…' : '写入 DSH 本体')
+                    : null
+                )
+              )
+            )
+          ),
+          h('div', { className: 'ar-note' }, '已排在队列里的任务各自带着模型，不会跟着切换；只有之后新加的任务用「任务队列默认」。')
+        )
+      )
+    }
+
     return {
       inject: ['slots'],
       apply(ctx) {
@@ -1010,6 +2014,18 @@ window.__ModuleLoader__.load({
           ctx.slots.register(
             { name: 'settings.section', id: 'auto-repair', order: 50, label: '自愈' },
             AutoRepairPanel
+          )
+        )
+        ctx.slots.inject('settings.section', () =>
+          ctx.slots.register(
+            { name: 'settings.section', id: 'vendors', order: 45, label: '模型供应商' },
+            VendorsSection
+          )
+        )
+        ctx.slots.inject('settings.section', () =>
+          ctx.slots.register(
+            { name: 'settings.section', id: 'model-manage', order: 43, label: '模型管理' },
+            ManageSection
           )
         )
       }

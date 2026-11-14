@@ -45,12 +45,12 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { diagnoseAll, SEVERITY, ROOT, dshPorts } from './diagnose.mjs'
 import { applyRepair, FIXERS, NEEDS_HUMAN } from './repair.mjs'
-import { notify } from './notify.mjs'
+import { notify, readNotifyPolicy } from './notify.mjs'
 import { readPolicy, writePolicy, canAutoRepair, isRejected, MODES } from './policy.mjs'
 import { readHandoffs, writeHandoff, feedHashOf, shouldFeed, markFed } from './agent-repair.mjs'
 import { listModels, readChoice, writeChoice, findModel, readinessOf } from './models.mjs'
 import { scanClients, setClient } from './clients.mjs'
-import { publicEndpoints, patchEndpoint, validateBaseUrl, probeEndpoint, PROVIDER_DEFAULT_BASE } from './providers.mjs'
+import { publicEndpoints, patchEndpoint, validateBaseUrl, probeEndpoint, PROVIDER_DEFAULT_BASE, listVendors, addCustomProvider, updateCustomProvider, removeCustomProvider } from './providers.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const STATE = path.join(HERE, 'state')
@@ -77,7 +77,7 @@ const argOf = (name, fallback = '') => {
 const JSON_ONLY = ARGS.some((a) =>
   ['--check', '--repair', '--repair-all', '--agent', '--get-policy', '--set-policy',
     '--models', '--get-model', '--set-model', '--scan-clients', '--set-client',
-    '--providers', '--set-provider', '--probe-provider'].includes(a)
+    '--providers', '--set-provider', '--probe-provider', '--custom-provider', '--notify-test'].includes(a)
 )
 const QUIET_STDOUT = JSON_ONLY
 
@@ -463,6 +463,19 @@ function enrich(findings, policy) {
 
 // ── 入口 ────────────────────────────────────────────────────────────────────
 
+// 模拟一条「自动修复成功」的通知，用来验证通知策略：silent 时应被拦下。
+if (ARGS.includes('--notify-test')) {
+  const mode = readNotifyPolicy()
+  const results = await notify(
+    '✅ 自动修复：通知策略自检（模拟）',
+    '这是一条模拟的「修复成功」通知，只用于验证当前通知策略会不会对外推送。',
+    'l1'
+  )
+  const pushed = results.some(([, ok]) => ok === true)
+  console.log(JSON.stringify({ ok: true, mode, results, pushed }))
+  process.exit(0)
+}
+
 if (ARGS.includes('--get-policy')) {
   console.log(JSON.stringify({ ok: true, policy: readPolicy(), modes: MODES }))
   process.exit(0)
@@ -598,7 +611,31 @@ if (ARGS.includes('--set-client')) {
 
 // 提供方接入信息：API 地址 + Key 是否已配置（永不输出明文）
 if (ARGS.includes('--providers')) {
-  console.log(JSON.stringify({ ok: true, providers: publicEndpoints(), defaults: PROVIDER_DEFAULT_BASE }))
+  console.log(JSON.stringify({
+    ok: true,
+    providers: publicEndpoints(),
+    defaults: PROVIDER_DEFAULT_BASE,
+    vendors: listVendors(),
+  }))
+  process.exit(0)
+}
+
+// 自定义提供方的新增 / 修改 / 删除（面板调用）
+if (ARGS.includes('--custom-provider')) {
+  const raw = argOf('--custom-provider')
+  let req = {}
+  try { req = JSON.parse(raw || '{}') } catch { req = {} }
+  try {
+    const action = String(req.action || '').trim()
+    let out
+    if (action === 'add') out = addCustomProvider(req)
+    else if (action === 'update') out = updateCustomProvider(String(req.id || ''), req)
+    else if (action === 'remove') out = removeCustomProvider(String(req.id || ''))
+    else throw new Error('action 只能是 add / update / remove')
+    console.log(JSON.stringify({ ok: true, ...out, vendors: listVendors() }))
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: e?.message || String(e) }))
+  }
   process.exit(0)
 }
 
@@ -642,7 +679,7 @@ if (ARGS.includes('--probe-provider')) {
   const id = String(req.id || '').trim()
   const explicit = req.baseUrl !== undefined ? String(req.baseUrl || '') : undefined
   const stored = publicEndpoints()[id] || {}
-  const target = explicit !== undefined ? explicit : (stored.baseUrl || stored.defaultBaseUrl || '')
+  const target = explicit !== undefined ? explicit : (stored.baseUrl || stored.defaultBaseUrl || PROVIDER_DEFAULT_BASE[id] || '')
   const r = await probeEndpoint(target)
   console.log(JSON.stringify({ ok: r.ok === true, provider: id || null, ...r }))
   process.exit(0)

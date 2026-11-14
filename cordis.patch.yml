@@ -2,25 +2,190 @@
     - id: dsh-auto-repair-ui
       name: 'dsh-auto-repair-ui'
 
-# ── MiniMax 模型路由（bundle 层）────────────────────────────────────────────
-# 面板「AI 模型」里的 minimax / minimax-cn 选项由这段注册。
-# 用 DSH 自带的 @deepseek-ai/dsh-llm-pi-ai（安装目录里已有），不新增第三方依赖；
-# 模型目录/协议都从安装目录继承，这里只声明路由和「按名引用」的凭据。
+# ── 模型路由（bundle 层）────────────────────────────────────────────────────
+# 由「模型供应商」页自动生成：预设厂商 + 用户自定义厂商都在这里注册。
+# 用 DSH 自带的 @deepseek-ai/dsh-llm-pi-ai，不新增第三方依赖。
 #
-# ⚠ 为什么写在 bundle 层：DSH 保存设置时会重写 profile 的 cordis.patch.yml，
+# ⚠ 写在 bundle 层：DSH 保存设置时会重写 profile 的 cordis.patch.yml，
 #   并抹掉它不管理的行（见 auto-repair/README.md「QQ 桥接掉了」的根因）。
 #   bundle 层只在启动时读取、永不被写回，所以注册放这里最稳。
 #
-# Key 不在本文件里：填在 DSH 设置里配置凭据 MINIMAX_API_KEY / MINIMAX_CN_API_KEY，
-# 或写进 ~/.dsh/.credentials.yaml 的 refs: 下，或使用同名环境变量。
+# Key 不在本文件里：填在 DSH 设置里配置凭据，或写进
+# ~/.dsh/.credentials.yaml 的 refs: 下，或使用同名环境变量。
+# 新增/删除供应商后需要重启一次 DSH 才会加载新路由。
 - insert:
     - id: llm-pi-ai
       name: '@deepseek-ai/dsh-llm-pi-ai'
       config:
         providers:
+          zhipu:
+            apiKeyEnv: ZHIPU_API_KEY
+            displayName: '智谱 GLM'
+            api: openai-completions
+            baseURL: 'https://open.bigmodel.cn/api/paas/v4'
+            models:
+              - { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 200000 }
+              - { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 200000, input: [text, image] }
+              - { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', contextWindow: 200000 }
+              - { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 200000 }
+              - { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000 }
+              - { id: 'glm-5', name: 'GLM-5', contextWindow: 200000 }
+              - { id: 'glm-5-turbo', name: 'GLM-5-Turbo', contextWindow: 200000 }
+              - { id: 'glm-4.7', name: 'GLM-4.7', contextWindow: 200000 }
+              - { id: 'glm-4.7-flashx', name: 'GLM-4.7-FlashX', contextWindow: 200000 }
+              - { id: 'glm-4.6', name: 'GLM-4.6', contextWindow: 200000 }
+              - { id: 'glm-4.5-air', name: 'GLM-4.5-Air', contextWindow: 128000 }
+              - { id: 'glm-4.5-airx', name: 'GLM-4.5-AirX', contextWindow: 128000 }
+              - { id: 'glm-4-long', name: 'GLM-4-Long', contextWindow: 1000000 }
+              - { id: 'glm-4.7-flash', name: 'GLM-4.7-Flash', contextWindow: 200000 }
+              - { id: 'glm-4.5-flash', name: 'GLM-4.5-Flash', contextWindow: 128000 }
+              - { id: 'glm-4-flash-250414', name: 'GLM-4-Flash-250414', contextWindow: 128000 }
+              - { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200000, input: [text, image] }
+              - { id: 'glm-4.6v', name: 'GLM-4.6V', contextWindow: 128000, input: [text, image] }
+              - { id: 'glm-4.6v-flash', name: 'GLM-4.6V-Flash', contextWindow: 128000, input: [text, image] }
+              - { id: 'glm-4.1v-thinking-flashx', name: 'GLM-4.1V-Thinking-FlashX', contextWindow: 128000, input: [text, image] }
+              - { id: 'glm-4v-flash', name: 'GLM-4V-Flash', contextWindow: 128000, input: [text, image] }
           minimax:
             apiKeyEnv: MINIMAX_API_KEY
-            displayName: MiniMax
+            displayName: 'MiniMax（国际站）'
+            api: anthropic-messages
+            baseURL: 'https://api.minimax.io/anthropic'
+            models:
+              - { id: 'MiniMax-M3.1-Flash', name: 'MiniMax-M3.1-Flash' }
+              - { id: 'MiniMax-M2.7', name: 'MiniMax-M2.7' }
+              - { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax-M2.7-highspeed' }
+              - { id: 'MiniMax-M3', name: 'MiniMax-M3' }
           minimax-cn:
             apiKeyEnv: MINIMAX_CN_API_KEY
-            displayName: MiniMax 中国站
+            displayName: 'MiniMax（国内站）'
+            api: anthropic-messages
+            baseURL: 'https://api.minimaxi.com/anthropic'
+            models:
+              - { id: 'MiniMax-M2.7', name: 'MiniMax-M2.7' }
+              - { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax-M2.7-highspeed' }
+              - { id: 'MiniMax-M3', name: 'MiniMax-M3' }
+          openai:
+            apiKeyEnv: OPENAI_API_KEY
+            displayName: 'OpenAI'
+            api: openai-completions
+            baseURL: 'https://api.openai.com/v1'
+            models:
+              - { id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 1050000 }
+              - { id: 'gpt-5.5-pro', name: 'GPT-5.5 Pro', contextWindow: 1050000 }
+              - { id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 1000000 }
+              - { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini', contextWindow: 400000 }
+          anthropic:
+            apiKeyEnv: ANTHROPIC_API_KEY
+            displayName: 'Anthropic Claude'
+            api: openai-completions
+            baseURL: 'https://api.anthropic.com/v1'
+            models:
+              - { id: 'claude-fable-5', name: 'Claude Fable 5', contextWindow: 1000000 }
+              - { id: 'claude-opus-5', name: 'Claude Opus 5', contextWindow: 1000000 }
+              - { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', contextWindow: 1000000 }
+              - { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: 200000 }
+          google:
+            apiKeyEnv: GEMINI_API_KEY
+            displayName: 'Google Gemini'
+            api: openai-completions
+            baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/'
+            models:
+              - { id: 'gemini-4-argon', name: 'Gemini 4 Argon', contextWindow: 1048576 }
+              - { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1000000, input: [text, image] }
+              - { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', contextWindow: 1000000, input: [text, image] }
+              - { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', contextWindow: 1048576 }
+              - { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', contextWindow: 1048576 }
+          deepseek:
+            apiKeyEnv: DEEPSEEK_API_KEY
+            displayName: 'DeepSeek 官方'
+            api: openai-completions
+            baseURL: 'https://api.deepseek.com/v1'
+            models:
+              - { id: 'deepseek-flash', name: 'DeepSeek Flash', contextWindow: 1000000, input: [text, image] }
+              - { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1000000 }
+          dashscope:
+            apiKeyEnv: DASHSCOPE_API_KEY
+            displayName: '阿里通义千问（百炼）'
+            api: openai-completions
+            baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+            models:
+              - { id: 'qwen3.8-max', name: '通义千问 3.8 Max', contextWindow: 1000000 }
+              - { id: 'qwen3.8-flash', name: '通义千问 3.8 Flash', contextWindow: 1000000, input: [text, image] }
+              - { id: 'qwen3.7-plus', name: '通义千问 3.7 Plus', contextWindow: 1000000, input: [text, image] }
+          ark:
+            apiKeyEnv: ARK_API_KEY
+            displayName: '字节豆包（火山方舟）'
+            api: openai-completions
+            baseURL: 'https://ark.cn-beijing.volces.com/api/v3'
+            models:
+              - { id: 'doubao-seed-evolving', name: '豆包 Seed Evolving', contextWindow: 262144 }
+              - { id: 'doubao-seed-2-1-pro-260628', name: '豆包 Seed 2.1 Pro', contextWindow: 262144, input: [text, image] }
+              - { id: 'doubao-seed-2-1-turbo-260628', name: '豆包 Seed 2.1 Turbo', contextWindow: 262144 }
+              - { id: 'doubao-seed-2-0-lite-260428', name: '豆包 Seed 2.0 Lite', contextWindow: 262144 }
+          moonshot:
+            apiKeyEnv: MOONSHOT_API_KEY
+            displayName: '月之暗面 Kimi'
+            api: openai-completions
+            baseURL: 'https://api.moonshot.cn/v1'
+            models:
+              - { id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', contextWindow: 1048576, input: [text, image] }
+              - { id: 'kimi-k3.1-pro-highspeed', name: 'Kimi K3.1 Pro 高速版', contextWindow: 1048576, input: [text, image] }
+              - { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1048576 }
+          baichuan:
+            apiKeyEnv: BAICHUAN_API_KEY
+            displayName: '百川智能'
+            api: openai-completions
+            baseURL: 'https://api.baichuan-ai.com/v1'
+            models:
+              - { id: 'Baichuan4-Turbo', name: '百川 4 Turbo', contextWindow: 32768 }
+              - { id: 'Baichuan4-Air', name: '百川 4 Air', contextWindow: 32768 }
+              - { id: 'Baichuan-M3-Plus', name: '百川 M3 Plus', contextWindow: 32768 }
+              - { id: 'Baichuan-M3', name: '百川 M3', contextWindow: 32768 }
+          hunyuan:
+            apiKeyEnv: HUNYUAN_API_KEY
+            displayName: '腾讯混元'
+            api: openai-completions
+            baseURL: 'https://api.hunyuan.cloud.tencent.com/v1'
+            models:
+              - { id: 'hy4', name: '混元 Hy4', contextWindow: 1048576, input: [text, image] }
+              - { id: 'hy4-preview', name: '混元 Hy4 Preview', contextWindow: 1048576 }
+              - { id: 'hy3', name: '混元 Hy3', contextWindow: 262144 }
+              - { id: 'hy-mt2-pro', name: '混元翻译 Pro' }
+          stepfun:
+            apiKeyEnv: STEPFUN_API_KEY
+            displayName: '阶跃星辰 StepFun'
+            api: openai-completions
+            baseURL: 'https://api.stepfun.com/v1'
+            models:
+              - { id: 'step-5-preview', name: 'Step 5 Preview', contextWindow: 1000000, input: [text, image] }
+              - { id: 'step-3.7-flash', name: 'Step 3.7 Flash', input: [text, image] }
+              - { id: 'step-3.5-flash', name: 'Step 3.5 Flash' }
+              - { id: 'step-1o-turbo-vision', name: 'Step 1o Turbo Vision', input: [text, image] }
+          yi:
+            apiKeyEnv: YI_API_KEY
+            displayName: '零一万物 01.AI'
+            api: openai-completions
+            baseURL: 'https://api.lingyiwanwu.com/v1'
+            models:
+              - { id: 'yi-lightning', name: 'Yi-Lightning', contextWindow: 16384 }
+              - { id: 'yi-vision-v2', name: 'Yi-Vision V2', contextWindow: 16384, input: [text, image] }
+          spark:
+            apiKeyEnv: SPARK_API_KEY
+            displayName: '讯飞星火'
+            api: openai-completions
+            baseURL: 'https://spark-api-open.xf-yun.com/v1'
+            models:
+              - { id: 'spark-x2.5', name: '星火 X2.5', contextWindow: 262144 }
+              - { id: 'spark-x', name: '星火 X2-Flash' }
+              - { id: 'spark-x2.6', name: '星火 X2.6', contextWindow: 1000000 }
+          openrouter:
+            apiKeyEnv: OPENROUTER_API_KEY
+            displayName: 'OpenRouter（聚合转发）'
+            api: openai-completions
+            baseURL: 'https://openrouter.ai/api/v1'
+            models:
+              - { id: 'anthropic/claude-opus-5.5', name: 'Claude Opus 5.5', contextWindow: 1000000 }
+              - { id: 'openai/gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 1050000 }
+              - { id: 'openai/gpt-6-luna', name: 'GPT-6 Luna', contextWindow: 1050000 }
+              - { id: 'google/gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1050000, input: [text, image] }
+              - { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1050000 }
