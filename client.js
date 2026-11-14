@@ -1262,6 +1262,9 @@ window.__ModuleLoader__.load({
       const [busyUse, setBusyUse] = useState('')
       // 每个厂商卡片的模型列表是否展开（默认全收起，状态在本次会话内保持）
       const [openModels, setOpenModels] = useState(() => ({ ...VN_OPEN }))
+      // 发送频率：开关 / 每分钟上限（null = 输入框显示当前已保存值，不显示未提交的草稿）
+      const [sendRateBusy, setSendRateBusy] = useState(false)
+      const [sendRateDraft, setSendRateDraft] = useState(null)
 
       const load = useCallback(async () => {
         try {
@@ -1304,6 +1307,50 @@ window.__ModuleLoader__.load({
 
       function setKey(id, v) { setKeyDraft((d) => ({ ...d, [id]: v })) }
       function setBase(id, v) { setBaseDraft((d) => ({ ...d, [id]: v })) }
+
+      /** 改「发送频率」开关或每分钟上限：桥接按文件热读，保存后立即生效，不用重启。 */
+      async function updateSendRate(patch) {
+        setSendRateBusy(true)
+        setErr('')
+        setNote('')
+        try {
+          const r = await fetchJson('/send-rate', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(patch)
+          })
+          if (r && r.ok === false) setErr(String(r.error || '保存发送频率失败'))
+          else {
+            setNote(
+              patch.enabled === false ? '发送频率限制已关闭，桥接立即生效'
+                : patch.enabled === true ? '发送频率限制已开启，桥接立即生效'
+                  : `发送频率上限已改为 ${patch.perMinute} 条/分钟，桥接立即生效`
+            )
+            setSendRateDraft(null)
+            await load()
+          }
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setSendRateBusy(false)
+        }
+      }
+
+      /** 输入框失焦 / 回车：校验后保存；没改动或非法就恢复显示已保存值。 */
+      function saveSendRateDraft() {
+        if (sendRateDraft === null) return
+        const n = Math.round(Number(sendRateDraft))
+        if (!Number.isFinite(n) || n < 1 || n > 600) {
+          setErr('每分钟条数必须是 1–600 之间的整数')
+          setSendRateDraft(null)
+          return
+        }
+        if (n === sendRatePerMinute) {
+          setSendRateDraft(null)
+          return
+        }
+        updateSendRate({ perMinute: n })
+      }
 
       /** 一键切换运行通道：API（智谱）↔ DSH（DeepSeek） */
       async function setRoute(route) {
@@ -1424,6 +1471,35 @@ window.__ModuleLoader__.load({
         api: `API（${routeChannelModel('api') || 'glm-4.6v'}）`,
         dsh: `DSH（${routeChannelModel('dsh') || 'deepseek-flash'}）`
       }
+      // 发送频率：设置来自 auto-repair/state/send-rate.json，计数来自桥接实时状态文件。
+      const sendRate = (state && state.sendRate) || { enabled: true, perMinute: 10, stats: {} }
+      const sendRatePerMinute = Number(sendRate.perMinute) || 10
+      const srStats = sendRate.stats || {}
+      const srSent = Number(srStats.sentLastMinute) || 0
+      const srPending = Number(srStats.pending) || 0
+      const srLimited = srStats.limited === true
+      const replyUse = vendorUses.reply || null
+      const currentModelText = replyUse
+        ? `${replyUse.provider} / ${replyUse.model}`
+        : routeMode === 'dsh'
+          ? `deepseek-account / ${routeChannelModel('dsh') || 'deepseek-flash'}`
+          : routeMode === 'api'
+            ? `zhipu / ${routeChannelModel('api') || 'glm-4.6v'}`
+            : '未指定'
+      // 悬停 / 聚焦详情：三个区块显示同一组实时口径（状态 / 模型 / 最近一分钟实发 / 上限 / 是否排队）。
+      const rateDetail = [
+        `当前状态：${sendRate.enabled ? '开启（超限排队，不丢消息）' : '关闭（不限速）'}`,
+        `当前模型：${currentModelText}`,
+        `最近一分钟实发：${srSent} 条`,
+        `上限：${sendRate.enabled ? `${sendRatePerMinute} 条/分钟` : `不限制（原设定 ${sendRatePerMinute} 条/分钟）`}`,
+        `限流排队：${srLimited ? `是（等待 ${srPending} 条）` : '否'}`,
+        `统计更新：${srStats.updatedAt ? new Date(srStats.updatedAt).toLocaleTimeString('zh-CN') : '暂无数据（桥接启动后还没发过消息）'}`
+      ].join('\n')
+      const routeDetail = [
+        `当前通道：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : routeMode === 'api' ? 'API（智谱）' : '自定义'}`,
+        rateDetail
+      ].join('\n')
+      const replyDetail = ['用途：全天回复（自动回复用的模型）', rateDetail].join('\n')
       const models = vendors.reduce((n, v) => n + (v.models ? v.models.length : 0), 0)
       const counts = { ready: 0, nokey: 0, quota: 0, pending: 0 }
       for (const v of vendors) counts[vendorStatus(v)] += 1
@@ -1491,6 +1567,22 @@ window.__ModuleLoader__.load({
           .vn-addr summary{cursor:pointer;font-size:12px;opacity:.65}
           .vn-addr .ar-row{margin-top:8px}
           .vn-empty{padding:18px;text-align:center;opacity:.6;font-size:13px}
+          /* 悬停 / 聚焦详情：原生 title 在键盘聚焦时不显示，这里用伪元素补齐 */
+          .ar-tip{position:relative;display:inline-flex;align-items:center;gap:4px;cursor:help;outline:none;vertical-align:middle}
+          .ar-tip:focus-visible{outline:1px dashed rgba(64,132,255,.7);outline-offset:2px}
+          .ar-tip::after{
+            content:attr(data-tip);position:absolute;left:0;top:calc(100% + 6px);z-index:40;
+            width:min(360px,78vw);padding:8px 10px;border-radius:8px;
+            border:1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.3));
+            background:var(--dsw-alias-bg-layer-2, #1c1c1e);color:var(--dsw-alias-label-primary, inherit);
+            font-size:11px;line-height:1.6;font-weight:400;white-space:pre-line;text-align:left;
+            box-shadow:0 8px 24px rgba(0,0,0,.28);opacity:0;visibility:hidden;
+            transform:translateY(-3px);transition:opacity .12s ease,transform .12s ease;pointer-events:none;
+          }
+          .ar-tip:hover::after,.ar-tip:focus::after,.ar-tip:focus-within::after{opacity:1;visibility:visible;transform:none}
+          .ar-tip-mark{font-size:10px;opacity:.6;border:1px solid rgba(127,127,127,.35);border-radius:999px;padding:0 5px}
+          .sr-divider{height:1px;background:rgba(127,127,127,.18);margin:12px 0}
+          .sr-num{width:84px;flex:0 0 auto;min-width:0;padding:4px 8px}
         `),
 
         h('div', { className: 'ar-head' },
@@ -1532,7 +1624,14 @@ window.__ModuleLoader__.load({
         // ── 运行通道：API（智谱） ↔ DSH（DeepSeek） ────────────────────────────
         h('div', { className: 'ar-policy' },
           h('div', { className: 'ar-policy-head' },
-            h('div', { className: 'ar-policy-title' }, '运行通道'),
+            h('div', { className: 'ar-policy-title' }, '运行通道',
+              h('span', {
+                className: 'ar-tip',
+                tabIndex: 0,
+                'data-tip': routeDetail,
+                'aria-label': '运行通道详情：状态、当前模型、最近一分钟实发、上限、是否限流排队'
+              }, h('span', { className: 'ar-tip-mark' }, '详情'))
+            ),
             h('span', { className: 'ar-flag' }, routeMode === 'dsh' ? 'DSH（DeepSeek）' : routeMode === 'api' ? 'API（智谱）' : '自定义')
           ),
           h('div', { className: 'ar-policy-hint' },
@@ -1554,7 +1653,56 @@ window.__ModuleLoader__.load({
               routeMode === 'custom'
                 ? '当前：自定义（下方单用途选择优先）'
                 : `当前：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）'}`)
-          )
+          ),
+
+          // ── 发送频率：与通道按钮并排 ─────────────────────────────────────
+          h('div', { className: 'sr-divider' }),
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '发送频率',
+              h('span', {
+                className: 'ar-tip',
+                tabIndex: 0,
+                'data-tip': rateDetail,
+                'aria-label': '发送频率详情：状态、当前模型、最近一分钟实发、上限、是否限流排队'
+              }, h('span', { className: 'ar-tip-mark' }, '详情'))
+            ),
+            h('span', { className: 'ar-flag' }, sendRate.enabled ? '已开启' : '已关闭')
+          ),
+          h('div', { className: 'ar-row' },
+            h('div', { className: 'ar-seg' },
+              h('button', {
+                className: `ar-seg-btn ${sendRate.enabled ? 'on' : ''}`,
+                disabled: sendRateBusy,
+                onClick: () => updateSendRate({ enabled: true })
+              }, '开启'),
+              h('button', {
+                className: `ar-seg-btn ${!sendRate.enabled ? 'on' : ''}`,
+                disabled: sendRateBusy,
+                onClick: () => updateSendRate({ enabled: false })
+              }, '关闭')
+            ),
+            h('span', { className: 'ar-sub' }, '每分钟最多'),
+            h('input', {
+              className: 'ar-input sr-num',
+              type: 'number',
+              min: 1,
+              max: 600,
+              step: 1,
+              disabled: !sendRate.enabled || sendRateBusy,
+              value: sendRateDraft === null ? String(sendRatePerMinute) : sendRateDraft,
+              onChange: (e) => setSendRateDraft(String(e.target.value)),
+              onBlur: saveSendRateDraft,
+              onKeyDown: (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); saveSendRateDraft() }
+              }
+            }),
+            h('span', { className: 'ar-sub' }, '条（1–600）'),
+            h('span', { className: 'ar-sub' },
+              `最近一分钟实发 ${srSent} 条` + (srLimited ? ` · 正在排队 ${srPending} 条` : ''))
+          ),
+          h('div', { className: 'ar-policy-hint', style: { marginTop: '8px' } },
+            '开启后超出上限的消息会排队等下一分钟再发，不丢消息；排队过长时会私聊管理员告警一次。',
+            '开关与上限保存在状态文件里，桥接每次发送前热读，改完立即生效、不用重启。')
         ),
 
         // ── 三种用途各自独立指定（修复 / 队列默认 / 全天回复） ────────────────
@@ -1574,7 +1722,15 @@ window.__ModuleLoader__.load({
               const curVal = cur ? `${cur.provider}::${cur.model}` : ''
               const curInList = curVal && enabledOptions.some((o) => o.key === curVal)
               return h('div', { className: 'ar-row', key: k },
-                h('span', { className: 'ar-sub' }, label),
+                h('span', { className: 'ar-sub' }, label,
+                  k === 'reply'
+                    ? h('span', {
+                      className: 'ar-tip',
+                      tabIndex: 0,
+                      'data-tip': replyDetail,
+                      'aria-label': '全天回复详情：状态、当前模型、最近一分钟实发、上限、是否限流排队'
+                    }, h('span', { className: 'ar-tip-mark' }, '详情'))
+                    : null),
                 h('select', {
                   className: 'ar-select',
                   value: curVal,

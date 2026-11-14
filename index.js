@@ -1,4 +1,4 @@
-﻿// dsh-auto-repair-ui
+// dsh-auto-repair-ui
 // Copyright 2026 蝠羽科技 (fuyu-technology)  —  https://github.com/fuyu-technology
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,6 +55,7 @@ const VENDORS_PATH = `${API_BASE}/vendors`
 const MANAGE_PATH = `${API_BASE}/manage`
 const NOTIFY_PATH = `${API_BASE}/notify-policy`
 const REPEAT_ALERT_PATH = `${API_BASE}/repeat-alert`
+const SEND_RATE_PATH = `${API_BASE}/send-rate`
 
 // 智谱开放平台（bigmodel.cn）OpenAI 兼容接口的官方地址（docs.bigmodel.cn）。
 const ZHIPU_DEFAULT_BASE = 'https://open.bigmodel.cn/api/paas/v4'
@@ -474,6 +475,59 @@ function writeManageDoc(next) {
 // 「自动修复通知策略」：一个总开关，管所有对外推送（需求箱 / QQ 私聊 / Windows 气泡）。
 // 默认 notify（维持现状）；silent = 照常修、只不推送，面板历史与日志照常记录。
 const NOTIFY_POLICY_FILE = path.join(REPAIR_STATE, 'notify-policy.json')
+
+// 「发送频率限制」：每分钟最多发多少条。默认开启 · 10 条/分钟。
+// qq-bridge 每次发送前按 mtime 热读这份文件，面板改完立即生效，不需要重启桥接。
+const SEND_RATE_FILE = path.join(REPAIR_STATE, 'send-rate.json')
+// 桥接实时状态（最近一分钟实发条数 / 排队数 / 是否限流中 / 当前模型）。
+const SEND_RATE_STATS_FILE = path.join(path.dirname(REPAIR_DIR), 'qq-bridge', 'state', 'send-rate-stats.json')
+const SEND_RATE_DEFAULT = 10
+
+function readSendRate() {
+  const doc = readJson(SEND_RATE_FILE, null) || {}
+  const n = Math.round(Number(doc.perMinute))
+  return {
+    enabled: doc.enabled !== false,
+    perMinute: Number.isFinite(n) && n >= 1 ? Math.min(600, n) : SEND_RATE_DEFAULT,
+    updatedAt: Number(doc.updatedAt) || 0
+  }
+}
+
+function writeSendRate(patch = {}) {
+  try {
+    const cur = readSendRate()
+    const enabled = typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled
+    const n = Math.round(Number(patch.perMinute))
+    const perMinute = Number.isFinite(n) && n >= 1 ? Math.min(600, n) : cur.perMinute
+    fs.mkdirSync(REPAIR_STATE, { recursive: true })
+    const doc = { version: 1, enabled, perMinute, updatedAt: Date.now() }
+    const tmp = `${SEND_RATE_FILE}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, SEND_RATE_FILE)
+    return { ok: true, ...doc }
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+}
+
+function readSendRateStats() {
+  const doc = readJson(SEND_RATE_STATS_FILE, null) || {}
+  return {
+    sentLastMinute: Number(doc.sentLastMinute) || 0,
+    pending: Number(doc.pending) || 0,
+    waiting: Number(doc.waiting) || 0,
+    limited: doc.limited === true,
+    limitedSince: Number(doc.limitedSince) || 0,
+    model: String(doc.model || ''),
+    updatedAt: Number(doc.updatedAt) || 0
+  }
+}
+
+/** 面板展示用：设置（开关 / 上限） + 桥接实时状态。 */
+function sendRateSnapshot() {
+  const cfg = readSendRate()
+  return { enabled: cfg.enabled, perMinute: cfg.perMinute, updatedAt: cfg.updatedAt, stats: readSendRateStats() }
+}
 
 function readNotifyPolicy() {
   const doc = readJson(NOTIFY_POLICY_FILE, null) || {}
@@ -1050,6 +1104,34 @@ function apply(ctx) {
         }
         const r = writeRepeatAlert(mode)
         sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, repeatAlert: { mode: r.mode, updatedAt: r.updatedAt } } : r)
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
+  // ── 发送频率限制：开关 + 每分钟上限（桥接热读，改完立即生效） ──────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: SEND_RATE_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        sendJson(res, 200, { ok: true, sendRate: sendRateSnapshot() })
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        if (body.enabled === undefined && body.perMinute === undefined) {
+          sendJson(res, 400, { ok: false, error: '没有要改的字段' })
+          return
+        }
+        if (body.perMinute !== undefined && !(Number(body.perMinute) >= 1 && Number(body.perMinute) <= 600)) {
+          sendJson(res, 400, { ok: false, error: '每分钟条数必须是 1–600 之间的整数' })
+          return
+        }
+        const r = writeSendRate(body)
+        sendJson(res, r.ok ? 200 : 500, r.ok ? { ok: true, sendRate: sendRateSnapshot() } : r)
         return
       }
       sendJson(res, 405, { ok: false, error: '方法不允许' })
@@ -2287,6 +2369,7 @@ function apply(ctx) {
       vendors,
       uses: readModelUses().uses,
       enabled: readModelUses().enabled,
+      sendRate: sendRateSnapshot(),
       queue: { running: Boolean(zhipuPumpPromise), tasks: readZhipuQueue().tasks },
       routeFile: ROUTE_PATCH_FILE,
       routeNeeded: vendors.some((v) => !v.available)
