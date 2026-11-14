@@ -1,4 +1,4 @@
-// dsh-auto-repair-ui
+﻿// dsh-auto-repair-ui
 // Copyright 2026 蝠羽科技 (fuyu-technology)  —  https://github.com/fuyu-technology
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,7 @@
 //
 // 职责：把 auto-repair 守护进程的数据暴露成 HTTP API，供客户端面板读取和操作。
 //
-// 它**不自己干活**——真正的诊断和修复都在 D:\大肥鱼\auto-repair\ 里，
+// 它**不自己干活**——真正的诊断和修复都在 REPAIR_DIR 目录里，
 // 由独立的守护进程执行。这里只是「读状态 + 转发手动触发」的一层壳。
 //
 // 为什么是这个结构：
@@ -46,6 +46,8 @@ const REPAIR_ALL_PATH = `${API_BASE}/repair-all`
 const AGENT_PATH = `${API_BASE}/agent-assist`
 const IGNORE_PATH = `${API_BASE}/ignore`
 const MODELS_PATH = `${API_BASE}/models`
+const ROUTE_PATH = `${API_BASE}/route`
+const ROUTE_CHECK_PATH = `${API_BASE}/route-check`
 const CLIENTS_PATH = `${API_BASE}/clients`
 const PROVIDERS_PATH = `${API_BASE}/providers`
 const ZHIPU_PATH = `${API_BASE}/zhipu`
@@ -56,6 +58,10 @@ const REPEAT_ALERT_PATH = `${API_BASE}/repeat-alert`
 
 // 智谱开放平台（bigmodel.cn）OpenAI 兼容接口的官方地址（docs.bigmodel.cn）。
 const ZHIPU_DEFAULT_BASE = 'https://open.bigmodel.cn/api/paas/v4'
+// 额度故障的降级链（队列直连调用）：主模型报欠费/额度不足时，按顺序换更便宜或免费的模型重试。
+const QUEUE_FALLBACK_CHAINS = {
+  zhipu: ['glm-4.6v-flash', 'glm-4.7-flash'],
+}
 const PROVIDER_ENDPOINTS_FILE = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
   '.dsh-auto-repair',
@@ -63,12 +69,17 @@ const PROVIDER_ENDPOINTS_FILE = path.join(
 )
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-// auto-repair 守护进程的实际位置。
-// 注意：本插件装在 ~/.dsh/plugins/ 下，而守护进程在 D:\大肥鱼\auto-repair\
-// —— 两者**不在同一棵目录树**里，不能用相对路径推算，必须写死绝对路径。
-// （用相对路径 ../.. 会算出 ~/.dsh/ 下面去，找不到脚本。）
-// 绝对路径可用 REPAIR_DIR 覆盖，方便把插件搬到别的机器上。
-const REPAIR_DIR = process.env.REPAIR_DIR || 'D:\\大肥鱼\\auto-repair'
+// auto-repair 守护进程的位置：
+//   - 仓库内就地安装时，插件目录就在 auto-repair/ 下，HERE/.. 就是守护进程目录；
+//   - 装到 ~/.dsh/plugins 下时两者不在同一棵树，退回原来的绝对路径；
+//   - 两种情况都可用 REPAIR_DIR 覆盖，方便搬到别的盘符/机器。
+const REPAIR_DIR = process.env.REPAIR_DIR || (() => {
+  const local = path.resolve(HERE, '..')
+  try {
+    if (fs.existsSync(path.join(local, 'auto-repair.mjs'))) return local
+  } catch {}
+  return path.join(process.env.USERPROFILE || process.env.HOME || '', 'auto-repair')
+})()
 const REPAIR_STATE = path.join(REPAIR_DIR, 'state')
 const REPAIR_ENTRY = path.join(REPAIR_DIR, 'auto-repair.mjs')
 const ZHIPU_QUEUE_FILE = path.join(REPAIR_STATE, 'zhipu-queue.json')
@@ -79,7 +90,7 @@ const ROUTE_PATCH_FILE = path.join(HERE, 'cordis.patch.yml')
 function findNode() {
   const candidates = [
     path.join(process.env.USERPROFILE || '', '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'node', 'bin', 'node.exe'),
-    'D:\\大肥鱼\\SnowLuma\\node.exe'
+    path.join(process.env.USERPROFILE || '', 'SnowLuma', 'node.exe')
   ]
   for (const c of candidates) {
     try { if (fs.existsSync(c)) return c } catch {}
@@ -110,7 +121,7 @@ function readBody(req) {
  * 调 auto-repair 的 CLI。
  *
  * ⚠️ 为什么不直接在插件里 import 守护进程的模块？
- *   插件装在 ~/.dsh/plugins/ 下，守护进程在 D:\大肥鱼\auto-repair\ ——
+ *   插件装在 ~/.dsh/plugins/ 下，守护进程在 REPAIR_DIR 指向的目录 ——
  *   两棵完全不同的目录树，import 不到。只能以子进程方式调 CLI。
  *   好处也在这里：**策略与修复逻辑只有一份实现**（在守护进程那边），
  *   插件只负责传参和显示结果，不会出现两边逻辑对不上的情况。
@@ -170,10 +181,27 @@ function zhipuBaseUrl() {
 // 1.6 起按 provider 分条存（provider-quota.json），旧的智谱单文件仍然兼容。
 const ZHIPU_QUOTA_FILE = path.join(REPAIR_STATE, 'zhipu-quota.json')
 
-function zhipuQuotaError(text) {
+// 额度类错误识别（收紧版）：只认明确的欠费/额度错误码。
+// 普通 429 限流（rate limit / too many requests / 请求过于频繁）不算额度问题，
+// 否则一次临时限流就会被标成「欠费」，甚至触发不应有的降级/停用。
+function quotaErrorInfo(text) {
   const s = String(text || '')
-  if (!s) return false
-  return /余额|欠费|配额|额度|充值|quota|insufficient|payment required|\b402\b|billing/i.test(s)
+  if (!s) return null
+  const codes = []
+  const add = (c) => { if (c && !codes.includes(c)) codes.push(c) }
+  if (/(?:^|[^0-9])1113(?:[^0-9]|$)/.test(s)) add('1113')
+  if (/\b402\b/.test(s) && /(payment|required|余额|欠费|额度|配额|quota|billing)/i.test(s)) add('402')
+  if (/\bpayment\s+required\b/i.test(s)) add('402')
+  if (/insufficient[_\s-]?quota/i.test(s)) add('insufficient_quota')
+  if (/insufficient[_\s-]?(balance|funds|credit)/i.test(s)) add('insufficient_balance')
+  if (/余额不足|无可用资源包|账户欠费|已欠费|额度不足|额度已用尽|配额已用尽|余额已用尽/.test(s)) add('insufficient_balance')
+  if (/model[_\s-]?(not[_\s-]?(available|found)|deprecated|offline)|模型不可用|模型不存在|模型已下线|无可用模型/i.test(s)) add('model_unavailable')
+  if (!codes.length) return null
+  return { codes, excerpt: s.replace(/\s+/g, ' ').slice(0, 300) }
+}
+
+function zhipuQuotaError(text) {
+  return quotaErrorInfo(text) !== null
 }
 
 // 「额度耗尽」不是永久标签：之后成功过、或者失败证据超过 24 小时没有更新，就不再挂红标。
@@ -313,6 +341,12 @@ function readModelChoiceFile() {
 // 所以改修复用途时会同时通过 CLI --set-model 回写，保证两边一致。
 const MODEL_USES_FILE = path.join(REPAIR_STATE, 'model-uses.json')
 const MODEL_USES = ['repair', 'queue', 'reply']
+// 面板上的「运行通道」：一键切换全部用途，避免用户分别改三处配置。
+// API 走智谱直连；DSH 走 DSH 账号（DeepSeek），无需 API Key。
+const ROUTE_PROFILES = {
+  api: { provider: 'zhipu', model: 'glm-4.6v', label: 'API（智谱）' },
+  dsh: { provider: 'deepseek-account', model: 'deepseek-flash', label: 'DSH（DeepSeek）' }
+}
 const USE_LABEL = { repair: '修复', queue: '任务队列默认', reply: '全天回复' }
 
 function normalizeModelPair(provider, model) {
@@ -359,7 +393,12 @@ function readModelUses() {
   // 迁移时把修复模型标成已启用，否则界面上会出现「指定了但没启用」的矛盾状态。
   if (migrated) pushEnabled(uses.repair)
 
-  const out = { version: 1, enabled, uses, updatedAt: Number(src.updatedAt) || 0 }
+  const out = { version: 1, enabled, uses, route: 'custom', updatedAt: Number(src.updatedAt) || 0 }
+  // 运行通道：显式写 route；老文件按回复用途推断（deepseek-account → dsh，其它 → api）。
+  const routeRaw = String(src.route || '').trim()
+  out.route = ['api', 'dsh', 'custom'].includes(routeRaw)
+    ? routeRaw
+    : (uses.reply?.provider === 'deepseek-account' ? 'dsh' : 'api')
   // 首次读取/迁移时落盘一次，之后读写同一份文件，避免每次请求都重复迁移。
   if (!doc || migrated) writeModelUses(out)
   return out
@@ -372,6 +411,7 @@ function writeModelUses(next) {
       version: 1,
       enabled: Array.isArray(next.enabled) ? next.enabled : [],
       uses: next.uses || {},
+      route: ['api', 'dsh', 'custom'].includes(next.route) ? next.route : 'custom',
       updatedAt: Date.now()
     }
     const tmp = `${MODEL_USES_FILE}.tmp`
@@ -809,6 +849,7 @@ function apply(ctx) {
         current: readModelChoiceFile(),
         uses: usesDoc.uses,
         enabled: usesDoc.enabled,
+        route: usesDoc.route,
         warnings: []
       }
     }
@@ -837,7 +878,7 @@ function apply(ctx) {
     const cur = base.current || null
     const readiness = cur ? readinessFromProviders(base.providers || [], cur.provider, cur.model) : null
 
-    return { ...base, warnings: [...new Set(warnings)], readiness, uses: usesDoc.uses, enabled: usesDoc.enabled }
+    return { ...base, warnings: [...new Set(warnings)], readiness, uses: usesDoc.uses, enabled: usesDoc.enabled, route: usesDoc.route }
   }
 
   /**
@@ -1017,8 +1058,32 @@ function apply(ctx) {
 
   // ── 本地用量（口径：本地统计，非厂商账单） ────────────────────────────────
   const USAGE_PATH = `${API_BASE}/usage`
-  const USAGE_STORE = pathToFileURL('D:\\大肥鱼\\auto-repair\\usage.mjs').href
-  const PRICE_MOD = pathToFileURL('D:\\大肥鱼\\qq-bridge\\src\\model-prices.js').href
+  // 不再写死绝对路径：按「插件目录 → auto-repair → 仓库布局」依次找存在的文件，
+  // 别人 clone 到别处安装也能用；找不到就明确报错，而不是 import 崩在那里。
+  const firstExisting = (candidates) => {
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) return c } catch {}
+    }
+    return ''
+  }
+  const USAGE_FILE_PATH = firstExisting([
+    path.join(HERE, 'usage.mjs'),
+    path.join(REPAIR_DIR, 'usage.mjs'),
+    path.join(HERE, '..', 'usage.mjs')
+  ])
+  const PRICE_FILE_PATH = firstExisting([
+    path.join(HERE, '..', '..', 'qq-bridge', 'src', 'model-prices.js'),
+    path.join(HERE, '..', 'qq-bridge', 'src', 'model-prices.js'),
+    path.join(REPAIR_DIR, '..', 'qq-bridge', 'src', 'model-prices.js')
+  ])
+  const USAGE_STORE = USAGE_FILE_PATH ? pathToFileURL(USAGE_FILE_PATH).href : ''
+  const PRICE_MOD = PRICE_FILE_PATH ? pathToFileURL(PRICE_FILE_PATH).href : ''
+  let usageStorePromise = null
+  const loadUsageStore = async () => {
+    if (!USAGE_STORE) throw new Error('找不到 usage.mjs（用量账本模块）；可用 REPAIR_DIR 指定 auto-repair 目录')
+    if (!usageStorePromise) usageStorePromise = import(USAGE_STORE)
+    return usageStorePromise
+  }
 
   /** 北京时间自然日 key。 */
   const dayKeyOf = (t) => new Date(Number(t) + 8 * 3600 * 1000).toISOString().slice(0, 10)
@@ -1030,7 +1095,7 @@ function apply(ctx) {
       const method = String(req.method || 'GET').toUpperCase()
       const url = new URL(String(req.url || ''), 'http://127.0.0.1')
       try {
-        const store = await import(USAGE_STORE)
+        const store = await loadUsageStore()
         if (method === 'GET') {
           const days = Number(url.searchParams.get('days')) === 30 ? 30 : 7
           const source = String(url.searchParams.get('source') || 'all')
@@ -1301,7 +1366,7 @@ function apply(ctx) {
             return
           }
           const uses = { ...doc.uses, [use]: null }
-          const saved = writeModelUses({ ...doc, uses })
+          const saved = writeModelUses({ ...doc, uses, route: 'custom' })
           if (!saved) {
             sendJson(res, 200, { ok: false, error: '写入 model-uses.json 失败' })
             return
@@ -1327,7 +1392,7 @@ function apply(ctx) {
         const uses = { ...doc.uses, [use]: { provider, model } }
         const key = `${provider}::${model}`
         const enabled = doc.enabled.some((x) => pairKey(x) === key) ? doc.enabled : [...doc.enabled, { provider, model }]
-        const saved = writeModelUses({ ...doc, uses, enabled })
+        const saved = writeModelUses({ ...doc, uses, enabled, route: 'custom' })
         if (!saved) {
           sendJson(res, 200, { ok: false, error: '写入 model-uses.json 失败' })
           return
@@ -1342,6 +1407,98 @@ function apply(ctx) {
         return
       }
       sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
+  // ── 运行通道：API（智谱） ↔ DSH（DeepSeek）一键切换 ────────────────────────
+  // 只改 model-uses.json / model-choice.json；桥接、守护进程和队列都按这两个文件实时取值，
+  // 所以切换后下一条消息 / 下一条任务立即生效，不需要用户改配置文件或重启。
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: ROUTE_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      const doc = readModelUses()
+      if (method === 'GET') {
+        sendJson(res, 200, { ok: true, route: doc.route, uses: doc.uses, enabled: doc.enabled, profiles: ROUTE_PROFILES })
+        return
+      }
+      if (method !== 'POST' && method !== 'PUT') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      const body = await readBody(req)
+      const route = String(body.route || '').trim()
+      const profile = ROUTE_PROFILES[route]
+      if (!profile) {
+        sendJson(res, 400, { ok: false, error: `不认识的运行通道：${route || '(空)'}` })
+        return
+      }
+      const uses = {}
+      for (const k of MODEL_USES) uses[k] = { provider: profile.provider, model: profile.model }
+      const key = `${profile.provider}::${profile.model}`
+      const enabled = doc.enabled.some((x) => pairKey(x) === key)
+        ? doc.enabled
+        : [...doc.enabled, { provider: profile.provider, model: profile.model }]
+      const saved = writeModelUses({ ...doc, uses, enabled, route })
+      if (!saved) {
+        sendJson(res, 200, { ok: false, error: '写入 model-uses.json 失败' })
+        return
+      }
+      // 修复用途还认 state/model-choice.json（守护进程只读那个文件），一起同步。
+      try {
+        fs.mkdirSync(REPAIR_STATE, { recursive: true })
+        fs.writeFileSync(
+          path.join(REPAIR_STATE, 'model-choice.json'),
+          JSON.stringify({ provider: profile.provider, model: profile.model, updatedAt: Date.now() }, null, 2) + '\n',
+          'utf8'
+        )
+      } catch (e) {
+        sendJson(res, 200, { ok: false, error: `运行通道已切换，但同步修复模型失败：${e?.message || e}` })
+        return
+      }
+      sendJson(res, 200, { ok: true, route: saved.route, uses: saved.uses, enabled: saved.enabled, profiles: ROUTE_PROFILES })
+    }
+  }))
+
+  // ── 运行通道自检：给「重新检测额度并开启」用 ──────────────────────────────
+  // DSH 通道：真跑一次最小 DSH 会话；API 通道：对智谱发一次最小真实请求。
+  // 只有当前通道确认可用，才允许重新打开全天回复。
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: ROUTE_CHECK_PATH,
+    handler: async (req, res) => {
+      if (String(req.method || 'GET').toUpperCase() !== 'POST' && String(req.method || 'GET').toUpperCase() !== 'PUT') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      try {
+        const doc = readModelUses()
+        if (doc.route === 'dsh') {
+          const model = String(doc.uses.reply?.model || 'deepseek-flash')
+          const r = await runCli(
+            ['--chat', JSON.stringify({ provider: 'deepseek-account', model, prompt: '只回复 OK', waitMs: 60000 })],
+            90000
+          )
+          const out = r.json || {}
+          sendJson(res, 200, {
+            ok: out.ok === true,
+            route: 'dsh',
+            model,
+            message: out.ok === true ? `DSH 通道可用（${model}）` : (out.error || r.error || 'DSH 调用失败')
+          })
+          return
+        }
+        const r = await recheckProvider('zhipu')
+        sendJson(res, 200, {
+          ok: r?.recheck?.ok === true,
+          route: 'api',
+          model: String(r?.recheck?.model || doc.uses.reply?.model || 'glm-4.6v'),
+          message: r?.recheck?.message || (r?.recheck?.ok ? '智谱通道可用' : '智谱额度/Key 不可用')
+        })
+      } catch (e) {
+        sendJson(res, 500, { ok: false, error: e?.message || String(e) })
+      }
     }
   }))
 
@@ -1714,7 +1871,42 @@ function apply(ctx) {
         task.error = ''
         writeZhipuQueue(doc.tasks)
 
-        const provider = String(task.provider || 'zhipu')
+        // 每次取任务时重新读运行通道：面板切换后，下一条任务立即按新通道执行。
+        const usesDoc = readModelUses()
+        const route = usesDoc.route
+        const queueUse = usesDoc.uses?.queue || null
+        const callStartedAt = Number(task.startedAt) || Date.now()
+
+        // DSH 通道：任务走 DSH 会话（DeepSeek 账号），不直连供应商 HTTP。
+        if (route === 'dsh' || queueUse?.provider === 'deepseek-account' || task.provider === 'deepseek-account') {
+          const model = String(queueUse?.model || task.model || 'deepseek-flash')
+          const r = await runCli(['--chat', JSON.stringify({ provider: 'deepseek-account', model, prompt: task.prompt })], 240000)
+          const out = r.json || {}
+          task.finishedAt = Date.now()
+          if (out.ok) {
+            task.status = 'done'
+            task.result = String(out.result || '').slice(0, 8000)
+            task.error = ''
+          } else {
+            task.status = 'failed'
+            task.error = String(out.error || r.error || r.stderr || 'DSH 任务失败').slice(0, 600)
+          }
+          loadUsageStore()
+            .then((store) => store.recordQueueCall({
+              t: Date.now(),
+              provider: 'deepseek-account',
+              model,
+              usage: null,
+              ms: Math.max(0, Date.now() - callStartedAt),
+              ok: task.status === 'done',
+              err: task.error || ''
+            }))
+            .catch(() => { /* 记账失败不影响队列 */ })
+          writeZhipuQueue(doc.tasks)
+          continue
+        }
+
+        const provider = String(queueUse?.provider || task.provider || 'zhipu')
         const meta = await vendorMeta()
         const vendor = (meta.vendors || []).find((v) => v.id === provider)
         const ref = vendor?.keyEnv || ''
@@ -1735,44 +1927,88 @@ function apply(ctx) {
         }
 
         const modelMap = await vendorModelsMap()
-        const model = task.model || (modelMap[provider]?.models?.[0]?.id) || ''
+        const requestedModel = String(queueUse?.model || task.model || (modelMap[provider]?.models?.[0]?.id) || '')
         const base = providerBaseUrl(provider, meta).replace(/\/+$/, '')
-        try {
-          const res = await fetch(`${base}/chat/completions`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-            body: JSON.stringify({
-              model: model || 'glm-4.7',
-              messages: [{ role: 'user', content: task.prompt }],
-              stream: false
-            }),
-            signal: AbortSignal.timeout(180000)
-          })
-          const raw = await res.text()
-          let json = null
-          try { json = JSON.parse(raw) } catch {}
-          if (!res.ok) {
-            const msg = (json && json.error && json.error.message) || raw || `HTTP ${res.status}`
-            const errLine = `HTTP ${res.status}：${String(msg).slice(0, 600)}`
-            task.status = 'failed'
-            task.error = errLine
-            // 额度类错误单独记一份，页面据此显示「额度耗尽/需充值」，
-            // 而不是继续显示成「缺 Key」——两者原因和处理方式完全不同。
-            if (zhipuQuotaError(errLine)) {
-              writeQuotaFor(provider, { exhausted: true, at: Date.now(), message: errLine.slice(0, 300) })
+        const modelUsed = requestedModel || 'glm-4.7'
+        const availableModels = new Set((modelMap[provider]?.models || []).map((m) => String(m.id)))
+        // 主模型 → 同厂商免费/低价模型：额度类错误时逐个降级重试，确认都不行才判失败。
+        const models = [modelUsed]
+        for (const m of QUEUE_FALLBACK_CHAINS[provider] || []) {
+          if (m !== modelUsed && (!availableModels.size || availableModels.has(m)) && !models.includes(m)) models.push(m)
+        }
+        // 队列是直连供应商的，之前完全绕过账本 → 用量页看不到这部分消耗。
+        // 这里按响应里的 usage 补记（来源 queue）；拿不到 usage 就标 missing，不猜数字。
+        const recordCall = (model, okFlag, errText, usage) => {
+          loadUsageStore()
+            .then((store) => store.recordQueueCall({
+              t: Date.now(),
+              provider,
+              model,
+              usage,
+              ms: Math.max(0, Date.now() - callStartedAt),
+              ok: okFlag,
+              err: errText
+            }))
+            .catch(() => { /* 记账失败不影响队列 */ })
+        }
+        let lastErr = ''
+        let sawQuota = false
+        let hardStop = false
+        let succeeded = false
+        for (const model of models) {
+          try {
+            const res = await fetch(`${base}/chat/completions`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+              body: JSON.stringify({
+                model,
+                messages: [{ role: 'user', content: task.prompt }],
+                stream: false
+              }),
+              signal: AbortSignal.timeout(180000)
+            })
+            const raw = await res.text()
+            let json = null
+            try { json = JSON.parse(raw) } catch {}
+            if (!res.ok) {
+              const msg = (json && json.error && json.error.message) || raw || `HTTP ${res.status}`
+              const errLine = `HTTP ${res.status}：${String(msg).slice(0, 600)}`
+              lastErr = errLine
+              recordCall(model, false, errLine, json?.usage)
+              if (!zhipuQuotaError(errLine)) {
+                // 不是额度问题（Key 无效 / 参数错 / 普通限流）：换模型也没用，直接停。
+                hardStop = true
+                break
+              }
+              sawQuota = true
+              continue // 额度问题：换下一个更便宜/免费的模型
             }
-          } else {
             const content = json && json.choices && json.choices[0] && json.choices[0].message
               ? json.choices[0].message.content
               : ''
             task.status = 'done'
             task.result = typeof content === 'string' ? content.slice(0, 8000) : raw.slice(0, 2000)
+            task.error = ''
+            recordCall(model, true, '', json?.usage)
             // 能成功调用说明额度可用，立刻清掉旧的欠费提示（无论之前是否有记录）。
             writeQuotaOk(provider)
+            succeeded = true
+            break
+          } catch (e) {
+            lastErr = e?.name === 'TimeoutError' ? '请求超时（180 秒）' : String(e?.message || e)
+            recordCall(model, false, lastErr, null)
+            break
           }
-        } catch (e) {
+        }
+        if (!succeeded) {
           task.status = 'failed'
-          task.error = e?.name === 'TimeoutError' ? '请求超时（180 秒）' : String(e?.message || e)
+          task.error = models.length > 1 && sawQuota
+            ? `${lastErr}（已尝试 ${models.join(' / ')}）`
+            : lastErr
+          // 只有「整条降级链都报额度不足」才标欠费，避免 429 限流或参数错误被误判。
+          if (sawQuota && !hardStop) {
+            writeQuotaFor(provider, { exhausted: true, at: Date.now(), message: task.error.slice(0, 300) })
+          }
         }
         task.finishedAt = Date.now()
         writeZhipuQueue(doc.tasks)

@@ -1109,9 +1109,13 @@ window.__ModuleLoader__.load({
                   f.rejected ? h('span', { className: 'ar-flag rejected' }, '已忽略') : null,
                   f.fixable ? null : h('span', { className: 'ar-flag' }, '不能自动修'),
                   handoff && handoff.status === 'queued' ? h('span', { className: 'ar-flag agent' }, 'AI 处理中') : null,
+                  // 交给 AI 但没改动/空回复：不能显示成「已升级=成功」，要把真实结果亮出来。
+                  handoff && handoff.status === 'incomplete'
+                    ? h('span', { className: 'ar-flag rejected', title: handoff.reason || handoff.raw || '' }, 'AI 未完成·无改动')
+                    : null,
                   // 这一次走的是哪条路：插件修好的 / 升级给模型的
                   f.route === 'plugin' ? h('span', { className: 'ar-flag', title: f.routeDetail || '' }, '插件已修复') : null,
-                  f.route === 'model'
+                  f.route === 'model' && handoff?.status !== 'incomplete'
                     ? h('span', { className: 'ar-flag agent', title: f.routeDetail || '' },
                         `已升级给模型${handoff?.model ? `（${handoff.model}）` : ''}`)
                     : null
@@ -1134,8 +1138,8 @@ window.__ModuleLoader__.load({
                     onClick: () => toggleIgnore(f.code, !f.rejected)
                   }, f.rejected ? '取消忽略' : '忽略')
                 ),
-                handoff && handoff.reply
-                  ? h('div', { className: 'ar-reply' }, handoff.reply)
+                handoff && (handoff.reply || handoff.raw)
+                  ? h('div', { className: 'ar-reply' }, handoff.reply || handoff.raw)
                   : null
               )
             }))
@@ -1187,7 +1191,7 @@ window.__ModuleLoader__.load({
           '默认全关；扫不到就显示「未检测到」，也可以手填 .exe 完整路径。',
           h('br'),
           '手动诊断：',
-          h('code', null, 'node D:\\大肥鱼\\auto-repair\\auto-repair.mjs --check')
+          h('code', null, 'node <你的 auto-repair 目录>\\auto-repair.mjs --check')
         )
       )
     }
@@ -1301,6 +1305,30 @@ window.__ModuleLoader__.load({
       function setKey(id, v) { setKeyDraft((d) => ({ ...d, [id]: v })) }
       function setBase(id, v) { setBaseDraft((d) => ({ ...d, [id]: v })) }
 
+      /** 一键切换运行通道：API（智谱）↔ DSH（DeepSeek） */
+      async function setRoute(route) {
+        setBusy('route')
+        setErr('')
+        setNote('')
+        try {
+          const r = await fetchJson('/route', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ route })
+          })
+          if (r && r.ok === false) setErr(String(r.error || '切换运行通道失败'))
+          else {
+            setNote(`运行通道已切到 ${route === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）'}，下一条消息 / 下一条任务立即生效`)
+            await load()
+          }
+          return r
+        } catch (e) {
+          setErr(e?.message || String(e))
+        } finally {
+          setBusy('')
+        }
+      }
+
       /** 展开/收起某个厂商的模型列表（默认收起） */
       function toggleModels(id) {
         setOpenModels((prev) => {
@@ -1380,6 +1408,22 @@ window.__ModuleLoader__.load({
       }
 
       const vendors = Array.isArray(state && state.vendors) ? state.vendors : []
+      // state 可能还没加载完（null）：运行通道只做展示，不能在渲染时直接解引用。
+      const routeMode = (state && state.route) || 'custom'
+      // 运行通道按钮显示该通道实际选中的模型名：优先「全天回复」用途，其次队列默认 / 修复；
+      // 都没指定时退回该通道的默认模型，避免出现空括号。
+      const routeChannelModel = (route) => {
+        const provider = route === 'dsh' ? 'deepseek-account' : 'zhipu'
+        for (const use of ['reply', 'queue', 'repair']) {
+          const picked = vendorUses[use]
+          if (picked && picked.provider === provider && picked.model) return picked.model
+        }
+        return ''
+      }
+      const routeLabels = {
+        api: `API（${routeChannelModel('api') || 'glm-4.6v'}）`,
+        dsh: `DSH（${routeChannelModel('dsh') || 'deepseek-flash'}）`
+      }
       const models = vendors.reduce((n, v) => n + (v.models ? v.models.length : 0), 0)
       const counts = { ready: 0, nokey: 0, quota: 0, pending: 0 }
       for (const v of vendors) counts[vendorStatus(v)] += 1
@@ -1482,6 +1526,34 @@ window.__ModuleLoader__.load({
                 className: 'vn-tab' + (filter === k ? ' on' : ''),
                 onClick: () => setFilter(k)
               }, label))
+          )
+        ),
+
+        // ── 运行通道：API（智谱） ↔ DSH（DeepSeek） ────────────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('div', { className: 'ar-policy-title' }, '运行通道'),
+            h('span', { className: 'ar-flag' }, routeMode === 'dsh' ? 'DSH（DeepSeek）' : routeMode === 'api' ? 'API（智谱）' : '自定义')
+          ),
+          h('div', { className: 'ar-policy-hint' },
+            '一键切换「修复 / 队列默认 / 全天回复」实际调用的通道；切换后下一条消息、下一条任务立即生效，不用改配置文件。',
+            'API（智谱）走智谱直连；DSH（DeepSeek）走 DSH 账号、无需 API Key。任务队列始终串行：一条完成后再取下一条。'
+          ),
+          h('div', { className: 'ar-row' },
+            h('button', {
+              className: 'ar-btn' + (routeMode === 'api' ? ' primary' : ''),
+              disabled: busy === 'route',
+              onClick: () => setRoute('api')
+            }, routeLabels.api),
+            h('button', {
+              className: 'ar-btn' + (routeMode === 'dsh' ? ' primary' : ''),
+              disabled: busy === 'route',
+              onClick: () => setRoute('dsh')
+            }, routeLabels.dsh),
+            h('span', { className: 'ar-sub' },
+              routeMode === 'custom'
+                ? '当前：自定义（下方单用途选择优先）'
+                : `当前：${routeMode === 'dsh' ? 'DSH（DeepSeek）' : 'API（智谱）'}`)
           )
         ),
 
