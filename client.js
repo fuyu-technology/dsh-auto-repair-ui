@@ -1791,6 +1791,23 @@ window.__ModuleLoader__.load({
       const [pv, setPv] = useState('')
       const [mv, setMv] = useState('')
       const [results, setResults] = useState(null)
+      // 用量（本地账本，非厂商账单）
+      const [usageDays, setUsageDays] = useState(7)
+      const [usageSrc, setUsageSrc] = useState('all')
+      const [usage, setUsage] = useState(null)
+      const [usageErr, setUsageErr] = useState('')
+
+      const loadUsage = useCallback(async (days, src) => {
+        try {
+          const r = await fetchJson(`/usage?days=${days}&source=${encodeURIComponent(src)}`, { cache: 'no-store' })
+          if (r && r.ok === false) throw new Error(r.error || '读取用量失败')
+          setUsage(r)
+          setUsageErr('')
+        } catch (e) {
+          setUsageErr(e?.message || String(e))
+        }
+      }, [])
+      useEffect(() => { loadUsage(usageDays, usageSrc) }, [loadUsage, usageDays, usageSrc])
 
       const load = useCallback(async () => {
         try {
@@ -1863,6 +1880,25 @@ window.__ModuleLoader__.load({
         send({ action: 'saveTakeover', takeover: next }, 'tk-' + key)
       }
 
+      // ── 用量卡片的小工具 ──
+      const US_SOURCES = [
+        { id: 'all', label: '全部' },
+        { id: 'repair', label: '修复' },
+        { id: 'queue', label: '队列' },
+        { id: 'reply', label: '全天回复' },
+        { id: 'bridge', label: '桥接兜底' }
+      ]
+      const fmtTok = (n) => {
+        const v = Number(n) || 0
+        if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`
+        if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`
+        return String(v)
+      }
+      const fmtCost = (n, sym) => `${sym || '¥'}${(Number(n) || 0).toFixed(4)}`
+      const usSeries = (usage && usage.series) || []
+      const usMax = Math.max(1, ...usSeries.map((s) => Number(s.tokens) || 0))
+      const usSym = usage?.meta?.symbol || '¥'
+
       function doSwitch() {
         if (!selProvider || !selModel) return
         const scopes = MANAGE_SCOPE_ROWS.filter((r) => takeover[r.key]).map((r) => r.key)
@@ -1904,6 +1940,24 @@ window.__ModuleLoader__.load({
           .mg-badge{font-size:11px;line-height:1.5;padding:1px 8px;border-radius:999px;border:1px solid rgba(127,127,127,.3);background:rgba(127,127,127,.1);white-space:normal;overflow-wrap:anywhere}
           .mg-badge.restart{border-color:rgba(214,158,46,.55);background:rgba(214,158,46,.14)}
           .mg-badge-note{font-size:11px;opacity:.62;white-space:normal;overflow-wrap:anywhere}
+          .us-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+          .us-local{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid rgba(214,158,46,.5);background:rgba(214,158,46,.12);white-space:nowrap}
+          .us-grid{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 4px}
+          .us-kpi{flex:1 1 120px;min-width:110px;padding:8px 10px;border:1px solid rgba(127,127,127,.18);border-radius:10px;background:rgba(127,127,127,.05)}
+          .us-kpi b{display:block;font-size:16px;line-height:1.4;font-variant-numeric:tabular-nums}
+          .us-kpi span{font-size:11px;opacity:.7}
+          .us-seg{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+          .us-seg-btn{font-size:11.5px;padding:3px 10px;border-radius:999px;border:1px solid rgba(127,127,127,.3);background:transparent;color:inherit;cursor:pointer;white-space:nowrap}
+          .us-seg-btn.on{background:rgba(127,127,127,.18);border-color:rgba(127,127,127,.5);font-weight:600}
+          .us-chart{width:100%;height:96px;display:block;margin:6px 0 2px;overflow:visible}
+          .us-axis{display:flex;justify-content:space-between;font-size:10.5px;opacity:.6;gap:8px}
+          .us-table{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:6px}
+          .us-table th{text-align:left;font-weight:600;opacity:.7;padding:3px 6px;border-bottom:1px solid rgba(127,127,127,.2);white-space:nowrap}
+          .us-table td{padding:3px 6px;border-bottom:1px solid rgba(127,127,127,.1);vertical-align:top}
+          .us-table td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+          .us-table td.name{overflow-wrap:anywhere}
+          .us-cap{font-size:11px;opacity:.65;margin-top:10px}
+          .us-err{font-size:11.5px;color:#c0392b;margin-top:6px;overflow-wrap:anywhere}
         `),
         h('div', { className: 'ar-section-title' }, '模型管理'),
         h('div', { className: 'ar-note' }, '一处切换当前生效的厂商/模型；下面每一项单独决定「跟不跟着变」，并标明是即时生效还是必须重启。'),
@@ -2003,6 +2057,105 @@ window.__ModuleLoader__.load({
             )
           ),
           h('div', { className: 'ar-note' }, '已排在队列里的任务各自带着模型，不会跟着切换；只有之后新加的任务用「任务队列默认」。')
+        ),
+
+        // ③ 用量（本地统计，非厂商账单）
+        h('div', { className: 'ar-card mg-sec' },
+          h('div', { className: 'us-head' },
+            h('div', { className: 'ar-section-title' }, '用量'),
+            h('span', { className: 'us-local' }, '本地统计，非厂商账单')
+          ),
+          h('div', { className: 'ar-note' }, '统计本机观察到的调用，费用按厂商目录价折算成估算值；厂商侧真实账单/额度以官方为准。'),
+          usageErr ? h('div', { className: 'us-err' }, usageErr) : null,
+          h('div', { className: 'us-grid' },
+            h('div', { className: 'us-kpi' },
+              h('b', null, usage ? String(usage.totals.count) : '—'),
+              h('span', null, '请求次数')),
+            h('div', { className: 'us-kpi' },
+              h('b', null, usage ? fmtTok(usage.totals.tokens) : '—'),
+              h('span', null, usage ? `Tokens（入 ${fmtTok(usage.totals.input)} / 出 ${fmtTok(usage.totals.output)}）` : 'Tokens')),
+            h('div', { className: 'us-kpi' },
+              h('b', null, usage ? fmtCost(usage.totals.cost, usSym) : '—'),
+              h('span', null, usage && usage.totals.unpriced ? `估算花费 · ${usage.totals.unpriced} 条未计价` : '估算花费'))
+          ),
+          h('div', { className: 'us-seg' },
+            [7, 30].map((d) => h('button', {
+              key: d,
+              className: `us-seg-btn ${usageDays === d ? 'on' : ''}`,
+              onClick: () => setUsageDays(d)
+            }, `近 ${d} 天`))
+          ),
+          h('div', { className: 'us-seg' },
+            US_SOURCES.map((s) => h('button', {
+              key: s.id,
+              className: `us-seg-btn ${usageSrc === s.id ? 'on' : ''}`,
+              onClick: () => setUsageSrc(s.id)
+            }, s.label))
+          ),
+          h('svg', { className: 'us-chart', viewBox: '0 0 700 90', preserveAspectRatio: 'none', role: 'img', 'aria-label': `近 ${usageDays} 天按天 tokens 柱状图` },
+            h('line', { x1: 0, y1: 89, x2: 700, y2: 89, stroke: 'rgba(127,127,127,.35)', strokeWidth: 1 }),
+            usSeries.map((s, i) => {
+              const bw = 700 / Math.max(1, usSeries.length)
+              const w = Math.max(2, bw * 0.62)
+              const x = i * bw + (bw - w) / 2
+              const hgt = Math.max(0, Math.round(((Number(s.tokens) || 0) / usMax) * 80))
+              return h('rect', {
+                key: s.d,
+                x, y: 88 - hgt, width: w, height: hgt,
+                rx: 2,
+                fill: s.tokens ? 'rgba(90,150,240,.75)' : 'rgba(127,127,127,.18)'
+              }, h('title', null, `${s.d}：${fmtTok(s.tokens)} tokens / ${s.count} 次 / ${fmtCost(s.cost, usSym)}`))
+            })
+          ),
+          h('div', { className: 'us-axis' },
+            h('span', null, usSeries[0]?.d || '—'),
+            h('span', null, usSeries[usSeries.length - 1]?.d || '—')
+          ),
+          h('table', { className: 'us-table' },
+            h('thead', null,
+              h('tr', null,
+                h('th', null, '厂商'),
+                h('th', { className: 'num' }, '次数'),
+                h('th', { className: 'num' }, 'Tokens'),
+                h('th', { className: 'num' }, '估算花费')
+              )
+            ),
+            h('tbody', null,
+              ((usage && usage.byProvider) || []).slice(0, 6).map((r) =>
+                h('tr', { key: r.provider },
+                  h('td', { className: 'name' }, r.provider),
+                  h('td', { className: 'num' }, String(r.count)),
+                  h('td', { className: 'num' }, fmtTok(r.tokens)),
+                  h('td', { className: 'num' }, r.unpriced && !r.cost ? '未计价' : fmtCost(r.cost, usSym))
+                )
+              ),
+              !(usage && usage.byProvider && usage.byProvider.length)
+                ? h('tr', null, h('td', { colSpan: 4, className: 'name' }, '这个范围内还没有记录'))
+                : null
+            )
+          ),
+          h('table', { className: 'us-table' },
+            h('thead', null,
+              h('tr', null,
+                h('th', null, '模型'),
+                h('th', { className: 'num' }, '次数'),
+                h('th', { className: 'num' }, 'Tokens'),
+                h('th', { className: 'num' }, '估算花费')
+              )
+            ),
+            h('tbody', null,
+              ((usage && usage.byModel) || []).slice(0, 8).map((r) =>
+                h('tr', { key: r.model },
+                  h('td', { className: 'name' }, r.model),
+                  h('td', { className: 'num' }, String(r.count)),
+                  h('td', { className: 'num' }, fmtTok(r.tokens)),
+                  h('td', { className: 'num' }, r.unpriced && !r.cost ? '未计价' : fmtCost(r.cost, usSym))
+                )
+              )
+            )
+          ),
+          h('div', { className: 'us-cap' },
+            '来源：全天回复读桥接的逐次 token 账本；修复由「让 AI 修」在每轮结束时按 step 写入；队列由 DSH 内部执行、桥接兜底目前未触发，两者暂无采集点（显示 0 属正常）。账本保留 90 天，超期自动清理。价目表里没有的厂商/模型显示「未计价」，不按兜底价编造。')
         )
       )
     }

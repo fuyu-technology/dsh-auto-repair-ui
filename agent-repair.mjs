@@ -27,6 +27,7 @@ import { diagnoseAll, SEVERITY, ROOT } from './diagnose.mjs'
 import { FIXERS, NEEDS_HUMAN } from './repair.mjs'
 import { readChoice } from './models.mjs'
 import { launchClientForProvider } from './clients.mjs'
+import { appendUsage } from './usage.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // 交接记录目录。同样支持 REPAIR_STATE_DIR 覆盖（测试用）。
@@ -207,6 +208,11 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
   // Node 按「被 import 的文件所在目录」解析依赖，所以这里必须用文件 URL。
   const clientMod = await import(pathToFileURL(path.join(BRIDGE_DIR, 'src', 'dsh-client.js')).href)
   const { NodeApiClient, unwrap, createTurnCollector } = clientMod
+  // 用量记账：从 DSH 事件里取 provider usage（与桥接 token 账本同一套归一化口径）。
+  const ledgerMod = await import(pathToFileURL(path.join(BRIDGE_DIR, 'src', 'token-ledger.js')).href)
+  const priceMod = await import(pathToFileURL(path.join(BRIDGE_DIR, 'src', 'model-prices.js')).href)
+  const usageOfEvent = ledgerMod.usageOfEvent
+  const { normalizeUsage } = priceMod
 
   const api = new NodeApiClient(baseUrl, undefined, {
     token: String(cfg?.dsh?.authToken || ''),
@@ -265,6 +271,10 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
   }
 
   const prompt = buildAgentPrompt(findings, { note, auto })
+  const startedAt = Date.now()
+  // 「让 AI 修」这一轮里每次模型请求的 usage（同一 turn/step/retry 后到覆盖先到）。
+  const usageSamples = new Map()
+  let turnError = ''
   const accepted = await api.sessions.prompt({
     sessionId,
     mode: 'queue',
@@ -283,13 +293,56 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
       const frame = envelope?.payload
       if (!frame || frame.type !== 'session/event') continue
       if (String(frame.sessionId) !== sessionId) continue
-      const done = collector.push(frame.event)
+      const event = frame.event
+      // 收集本轮的 token 用量（与桥接账本同口径：assistant/message|attempt 的 usage）
+      try {
+        const raw = usageOfEvent(event)
+        const turn = Number(event?.data?.turn)
+        const step = Number(event?.data?.step)
+        if (raw && Number.isFinite(turn) && Number.isFinite(step)) {
+          const retry = Number(event?.data?.retry) || 0
+          const buckets = normalizeUsage(raw)
+          usageSamples.set(`${turn}|${step}|${retry}`, {
+            t: Number.isFinite(Number(event.time)) ? Number(event.time) : Date.now(),
+            provider: event?.data?.provider ?? event?.data?.usage?.provider ?? '',
+            model: event?.data?.usage?.model ?? event?.data?.model ?? '',
+            buckets
+          })
+        }
+        if (event?.type === 'turn/error' || event?.type === 'error') {
+          turnError = String(event?.data?.message || event?.data?.code || 'error').slice(0, 120)
+        }
+      } catch { /* 记账采集失败不影响主链路 */ }
+      const done = collector.push(event)
       if (done) { reply = typeof done === 'string' ? done : (done?.text ?? ''); break }
       if (Date.now() > deadline) break
     }
   } catch {
     // 事件流断了无所谓：prompt 已经被 DSH 接受，agent 照样会干活。
   }
+
+  // 把本轮每一次模型请求记进本地用量账本（来源：修复）。
+  try {
+    const ordered = [...usageSamples.values()].sort((a, b) => a.t - b.t)
+    let prev = startedAt
+    for (const s of ordered) {
+      const b = s.buckets ?? {}
+      appendUsage({
+        t: s.t,
+        src: 'repair',
+        provider: s.provider || choice?.provider || '',
+        model: s.model || (appliedModel ? appliedModel.split('/').slice(1).join('/') : ''),
+        b,
+        input: (b.cacheMiss ?? 0) + (b.cacheHit ?? 0) + (b.cacheWrite ?? 0),
+        output: b.output ?? 0,
+        ms: Math.max(0, s.t - prev),
+        ok: !turnError,
+        err: turnError,
+        missing: false
+      })
+      prev = s.t
+    }
+  } catch { /* 记账失败不影响交接结果 */ }
 
   return {
     sessionId,

@@ -32,7 +32,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const NS = 'dsh-auto-repair-ui'
 const API_BASE = '/dsh-auto-repair'
@@ -953,6 +953,135 @@ function apply(ctx) {
         return
       }
       sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
+  // ── 本地用量（口径：本地统计，非厂商账单） ────────────────────────────────
+  const USAGE_PATH = `${API_BASE}/usage`
+  const USAGE_STORE = pathToFileURL('D:\\大肥鱼\\auto-repair\\usage.mjs').href
+  const PRICE_MOD = pathToFileURL('D:\\大肥鱼\\qq-bridge\\src\\model-prices.js').href
+
+  /** 北京时间自然日 key。 */
+  const dayKeyOf = (t) => new Date(Number(t) + 8 * 3600 * 1000).toISOString().slice(0, 10)
+
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: USAGE_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      const url = new URL(String(req.url || ''), 'http://127.0.0.1')
+      try {
+        const store = await import(USAGE_STORE)
+        if (method === 'GET') {
+          const days = Number(url.searchParams.get('days')) === 30 ? 30 : 7
+          const source = String(url.searchParams.get('source') || 'all')
+          const includeTest = url.searchParams.get('test') === '1'
+          // 从「days 天前的北京 0 点」开始，避免按滚动 24h 切割自然日。
+          const todayStart = new Date(`${dayKeyOf(Date.now())}T00:00:00+08:00`).getTime()
+          const sinceMs = todayStart - (days - 1) * 24 * 3600 * 1000
+          let records = store.readUsageRecords({ sinceMs, includeTest })
+          if (source !== 'all') records = records.filter((r) => r.src === source)
+
+          let prices = null
+          try {
+            prices = await import(PRICE_MOD)
+          } catch { /* 价目表读不到就全部标「未计价」，绝不编价格 */ }
+          const table = (() => {
+            try { return prices?.resolvePriceTable?.() ?? prices?.DEFAULT_PRICE_TABLE } catch { return prices?.DEFAULT_PRICE_TABLE }
+          })()
+
+          const totals = { count: 0, input: 0, output: 0, tokens: 0, cost: 0, unpriced: 0, missing: 0, failed: 0, ms: 0, msKnown: 0 }
+          const byDay = new Map()
+          const byProvider = new Map()
+          const byModel = new Map()
+          const bySource = new Map()
+          const bump = (map, key, r, cost, priced) => {
+            const cur = map.get(key) || { count: 0, input: 0, output: 0, tokens: 0, cost: 0, unpriced: 0 }
+            cur.count += 1
+            cur.input += r.input
+            cur.output += r.output
+            cur.tokens += r.input + r.output
+            cur.cost += cost
+            if (!priced) cur.unpriced += 1
+            map.set(key, cur)
+          }
+          for (const r of records) {
+            const buckets = r.b ?? { cacheMiss: r.input, cacheHit: 0, cacheWrite: 0, output: r.output }
+            let cost = 0
+            let priced = false
+            if (prices && table) {
+              try {
+                const rates = prices.ratesAt(r.m, r.t, table)
+                // 目录里没有这个模型时 ratesAt 会回落到兜底模型并置 estimated —— 那属于「编价格」，不采用。
+                if (!rates?.estimated) {
+                  cost = prices.costOfBuckets(buckets, rates).total
+                  priced = true
+                }
+              } catch { priced = false }
+            }
+            totals.count += 1
+            totals.input += r.input
+            totals.output += r.output
+            totals.tokens += r.input + r.output
+            totals.cost += cost
+            if (!priced) totals.unpriced += 1
+            if (r.missing) totals.missing += 1
+            if (!r.ok) totals.failed += 1
+            if (r.ms > 0) { totals.ms += r.ms; totals.msKnown += 1 }
+            bump(byDay, dayKeyOf(r.t), r, cost, priced)
+            bump(byProvider, r.p || '未知厂商', r, cost, priced)
+            bump(byModel, `${r.p || '未知厂商'}/${r.m || '未知模型'}`, r, cost, priced)
+            bump(bySource, r.src, r, cost, priced)
+          }
+          const series = []
+          for (let i = 0; i < days; i += 1) {
+            const d = dayKeyOf(sinceMs + i * 24 * 3600 * 1000)
+            const v = byDay.get(d) || { count: 0, input: 0, output: 0, tokens: 0, cost: 0, unpriced: 0 }
+            series.push({ d, ...v })
+          }
+          const rows = (map, keyName) => [...map.entries()]
+            .map(([k, v]) => ({ [keyName]: k, ...v, cost: Math.round(v.cost * 1e6) / 1e6 }))
+            .sort((a, b) => b.tokens - a.tokens)
+          sendJson(res, 200, {
+            ok: true,
+            meta: {
+              local: true,
+              note: '本地统计，非厂商账单',
+              days,
+              source,
+              pricedOk: Boolean(prices && table),
+              currency: table?.currency || 'CNY',
+              symbol: table?.symbol || '¥',
+              priceVersion: table?.version || ''
+            },
+            totals: { ...totals, cost: Math.round(totals.cost * 1e6) / 1e6, avgMs: totals.msKnown ? Math.round(totals.ms / totals.msKnown) : 0 },
+            series,
+            byProvider: rows(byProvider, 'provider'),
+            byModel: rows(byModel, 'model'),
+            bySource: rows(bySource, 'source')
+          })
+          return
+        }
+        if (method === 'POST') {
+          const body = await readBody(req)
+          if (body?.action === 'purge-test') {
+            const dropped = store.purgeTestRecords()
+            sendJson(res, dropped < 0 ? 500 : 200, dropped < 0 ? { ok: false, error: '清理失败（可能有别的进程在写）' } : { ok: true, dropped })
+            return
+          }
+          const list = Array.isArray(body?.records) ? body.records : (body?.record ? [body.record] : [])
+          if (!list.length) { sendJson(res, 400, { ok: false, error: '需要 records 数组' }); return }
+          let written = 0
+          for (const r of list.slice(0, 500)) {
+            if (store.appendUsage({ ...r, test: body?.test === true })) written += 1
+          }
+          sendJson(res, 200, { ok: true, written })
+          return
+        }
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+      } catch (e) {
+        sendJson(res, 500, { ok: false, error: `用量账本不可用：${e?.message || String(e)}` })
+      }
     }
   }))
 
