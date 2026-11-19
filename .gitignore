@@ -3,21 +3,29 @@ node_modules/
 *.tsbuildinfo
 
 # 运行期状态与日志（守护进程会持续写，别进仓库）
-state/
+state/*
+!state/repair-policy.json
 *.log
 *.pid
 
 # 备份文件
 *.bak
 *.bak-*
-*.auto-repair.bak-*
+*.orig
+*.vendors-bak-*
 
-# 令牌与凭据——**绝对不要提交**
+# 令牌与凭据——绝对不要提交
 *token*
 *secret*
 *.env
 *.env.*
 credentials.json
+.github-token
+
+# 临时文件
+*.tmp
+_tmp*
+tmp/
 
 # 编辑器 / 系统
 .DS_Store
