@@ -283,6 +283,12 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 - 依赖宿主守护进程支持 `--repair <code>`、`--repair-all`、`--agent <code> [--auto]`、`--set-policy`、
   `--models`、`--set-model`；宿主较旧时模型卡片会显示读不到目录，其余功能仍可用
 
+## 关于早期一次不完整的推送
+
+本仓库曾有一次推送没传完：`diagnose.mjs`、`repair.mjs` 和 `tools/` 下的两个依赖模块当时没进库，
+按那次的状态拉下来是跑不起来的。原因是收工太晚，没核完就关了机器。现在已经补齐，
+仓库里的文件与本地实际运行的那套一致，拉下来即可用。
+
 ## 许可
 
 Apache-2.0 · 蝠羽科技
