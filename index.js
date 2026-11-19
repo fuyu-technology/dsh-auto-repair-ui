@@ -21,7 +21,7 @@
 //
 // 职责：把 auto-repair 守护进程的数据暴露成 HTTP API，供客户端面板读取和操作。
 //
-// 它**不自己干活**——真正的诊断和修复都在 REPAIR_DIR 目录里，
+// 它**不自己干活**——真正的诊断和修复都在 D:\大肥鱼\auto-repair\ 里，
 // 由独立的守护进程执行。这里只是「读状态 + 转发手动触发」的一层壳。
 //
 // 为什么是这个结构：
@@ -80,7 +80,7 @@ const REPAIR_DIR = process.env.REPAIR_DIR || (() => {
   try {
     if (fs.existsSync(path.join(local, 'auto-repair.mjs'))) return local
   } catch {}
-  return path.join(process.env.USERPROFILE || process.env.HOME || '', 'auto-repair')
+  return 'D:\\大肥鱼\\auto-repair'
 })()
 const REPAIR_STATE = path.join(REPAIR_DIR, 'state')
 const REPAIR_ENTRY = path.join(REPAIR_DIR, 'auto-repair.mjs')
@@ -92,7 +92,7 @@ const ROUTE_PATCH_FILE = path.join(HERE, 'cordis.patch.yml')
 function findNode() {
   const candidates = [
     path.join(process.env.USERPROFILE || '', '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'node', 'bin', 'node.exe'),
-    path.join(process.env.USERPROFILE || '', 'SnowLuma', 'node.exe')
+    'D:\\大肥鱼\\SnowLuma\\node.exe'
   ]
   for (const c of candidates) {
     try { if (fs.existsSync(c)) return c } catch {}
@@ -123,7 +123,7 @@ function readBody(req) {
  * 调 auto-repair 的 CLI。
  *
  * ⚠️ 为什么不直接在插件里 import 守护进程的模块？
- *   插件装在 ~/.dsh/plugins/ 下，守护进程在 REPAIR_DIR 指向的目录 ——
+ *   插件装在 ~/.dsh/plugins/ 下，守护进程在 D:\大肥鱼\auto-repair\ ——
  *   两棵完全不同的目录树，import 不到。只能以子进程方式调 CLI。
  *   好处也在这里：**策略与修复逻辑只有一份实现**（在守护进程那边），
  *   插件只负责传参和显示结果，不会出现两边逻辑对不上的情况。

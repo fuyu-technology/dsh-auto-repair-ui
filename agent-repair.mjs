@@ -41,10 +41,55 @@ const FEED_FILE = path.join(STATE, 'feed-state.json')
 const PROMPT_LIMIT = 3000
 // 同一条报错（按特征哈希）多久之内不再重复投喂。
 const FEED_WINDOW_MS = 30 * 60 * 1000
+// 判定「这一轮到底有没有真的动手」：read / grep / glob / todo_write / web_* 一律不算，
+// 它们全成功也可能一个文件都没改。
+// 直接写盘的工具：调用成功即可认为改动过。
+const DIRECT_MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'delete_file', 'move_file', 'copy_file'])
+// 命令类工具：本身既能读也能写，只有命令文本里出现写操作时才算改动。
+// （实测：agent 用 pwsh 跑 Get-FileHash / Get-ChildItem 做只读核对，旧逻辑把 pwsh:ok 当成了「改过文件」。）
+const SHELL_TOOLS = new Set(['bash', 'pwsh', 'shell', 'powershell'])
+const SHELL_WRITE_RE = /(^|[^>=\-0-9])>{1,2}[^>=]|Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item|Rename-Item|Clear-Content|WriteAllText|WriteAllBytes|WriteAllLines|sed\s+-i|\btee\b|\btouch\b|\bmkdir\b|\brmdir\b|\brm\s|\bmv\s|\bcp\s|Expand-Archive|Compress-Archive|\bgit\s+(apply|checkout|reset|clean|stash|commit|add)\b|\bpatch\b|\bapplypatch\b|\bdd\s+/i
+const BARE_TOOL_NAME = (name) => String(name || '').split('__').pop().toLowerCase()
 const BRIDGE_DIR = path.join(ROOT, 'qq-bridge')
-// agent 的工作区放在大肥鱼根目录：它要能改 qq-bridge / auto-repair 这些地方，
-// 工作区太窄会够不着。
-const WORKSPACE_DIR = ROOT
+// agent 的工作区默认放在大肥鱼根目录：它要能改 qq-bridge / auto-repair 这些地方，
+// 工作区太窄会够不着。AGENT_REPAIR_WORKSPACE 可临时指到别的目录（自测/别的 checkout）。
+const WORKSPACE_DIR = process.env.AGENT_REPAIR_WORKSPACE ? path.resolve(process.env.AGENT_REPAIR_WORKSPACE) : ROOT
+
+// 工作区快照：判定「到底有没有真的落盘改动」的兜底口径。
+// 工具轨迹可能骗人（只读命令也可能叫 pwsh），但文件大小/修改时间不会。
+const SNAPSHOT_SKIP = new Set(['node_modules', '.git', '.venv', '__pycache__', 'dist', 'build', '.cache', '.next'])
+function snapshotWorkspace(dir, { limit = 40000, budgetMs = 8000 } = {}) {
+  const out = new Map()
+  const startedAt = Date.now()
+  const walk = (d) => {
+    if (out.size >= limit || Date.now() - startedAt > budgetMs) return
+    let entries = []
+    try { entries = fs.readdirSync(d, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      if (out.size >= limit || Date.now() - startedAt > budgetMs) return
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) {
+        if (!SNAPSHOT_SKIP.has(e.name)) walk(p)
+      } else if (e.isFile()) {
+        try { const st = fs.statSync(p); out.set(p, `${st.size}:${st.mtimeMs}`) } catch {}
+      }
+    }
+  }
+  walk(dir)
+  return out
+}
+function diffSnapshots(before, after) {
+  let added = 0
+  let removed = 0
+  let modified = 0
+  for (const [p, sig] of after) {
+    const old = before.get(p)
+    if (old === undefined) added += 1
+    else if (old !== sig) modified += 1
+  }
+  for (const p of before.keys()) if (!after.has(p)) removed += 1
+  return { added, removed, modified, total: added + removed + modified }
+}
 
 const args = process.argv.slice(2)
 const argOf = (name, fallback = '') => {
@@ -175,6 +220,7 @@ export function buildAgentPrompt(findings, { note = '', auto = false } = {}) {
     lines.push('')
   }
   lines.push('要求：')
+  lines.push('0. 本地文件一律用 read / write / edit / pwsh 工具读写；不要用 web_fetch 或 web_search 读本地路径（file:// 会被工具层直接拒绝，只是白费回合）。')
   lines.push('1. 先自己复核一遍问题是否仍然存在（诊断结论可能是几分钟前的旧状态），再动手。')
   lines.push('2. 改动任何文件前先备份；这台机器上的配置和脚本有既有约定，别顺手改无关的地方。')
   lines.push('3. 修完自己验证一遍（能跑就跑一下），并在总结里写清：根因、改了哪些文件、怎么验证的。')
@@ -193,11 +239,10 @@ export function buildAgentPrompt(findings, { note = '', auto = false } = {}) {
  * 拉起一个 DSH 会话，把 prompt 投进去。
  *
  * 关键点：
- *   - **不指定 agentPreset** → DSH 会套用它的默认 preset（standard），
- *     那个 preset 带 bash / 文件读写等本地工具 —— agent 真的能动手改东西。
- *     （反例：qq-chat* 系列 preset 刻意没有本地工具，那是给 QQ 群用的，
- *      这里不能用。）
+ *   - **显式挂 standard preset**：DSH 的默认 preset 可能被设成 qq-chat*（无本地工具），
+ *     那种会话只能看不能改。standard 带 read/write/edit/pwsh，agent 才真的能动手改东西。
  *   - 会话建在 D:\\大肥鱼 上，agent 的工作目录就在项目根。
+ *   - 判定成功与否看「有没有成功的写/改类工具调用」，不看 prompt 是否被接收。
  */
 export async function handoffToAgent(findings, { waitMs = 120000, note = '', auto = false } = {}) {
   const cfg = readJson(path.join(BRIDGE_DIR, 'config.json'), {})
@@ -224,8 +269,27 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
   const workspaceId = wsValue?.workspace?.workspaceId
   if (!workspaceId) throw new Error('创建 workspace 失败：拿不到 workspaceId')
 
-  // 不传 agentPreset → DSH 默认 preset（带本地工具）
-  const created = unwrap(await api.sessions.create({ workspaceId }), 'sessions.create')
+  // 显式挂带本地工具的 preset：DSH 的「默认 preset」被设成了 qq-chat-v2（无本地工具），
+  // 不指定 agentPreset 时修复会话只能看不能改，最后空回复还被当成成功。
+  // 优先 standard；没有就挑一个非 qq-chat 的；列表都读不到时仍按 standard 试一次。
+  let repairPreset = 'standard'
+  try {
+    const { presets } = unwrap(await api.agentPresets.list({}), 'agentPresets.list')
+    const ids = (presets || []).map((p) => String(p?.id || '')).filter(Boolean)
+    if (ids.length && !ids.includes(repairPreset)) {
+      repairPreset = ids.find((id) => !id.startsWith('qq-chat')) || ''
+    }
+  } catch { /* 读不到列表就按 standard 试，失败再退回默认 */ }
+
+  let created
+  try {
+    created = unwrap(await api.sessions.create({ workspaceId, ...(repairPreset ? { agentPreset: repairPreset } : {}) }), 'sessions.create')
+  } catch (error) {
+    if (!repairPreset) throw error
+    console.log(`[preset] 挂载 ${repairPreset} 失败（${error?.message || error}），退回 DSH 默认 preset`)
+    created = unwrap(await api.sessions.create({ workspaceId }), 'sessions.create')
+    repairPreset = ''
+  }
   const sessionId = String(created?.sessionId || '')
   if (!sessionId) throw new Error('创建 DSH 会话失败：拿不到 sessionId')
 
@@ -271,10 +335,42 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
   }
 
   const prompt = buildAgentPrompt(findings, { note, auto })
+  // 回合前的工作区快照：和回合后的快照对比，是「真的改了文件」的最终依据。
+  const beforeSnapshot = snapshotWorkspace(WORKSPACE_DIR)
   const startedAt = Date.now()
   // 「让 AI 修」这一轮里每次模型请求的 usage（同一 turn/step/retry 后到覆盖先到）。
   const usageSamples = new Map()
   let turnError = ''
+  // 工具轨迹：用来判定「这一轮到底改没改东西」，以及在没改动时保留原始输出。
+  const toolCalls = []
+  const callsById = new Map()
+  let turnReason = null
+  const collector = createTurnCollector()
+  const deadline = Date.now() + waitMs
+  let reply = ''
+  let timedOut = false
+  let streamLost = false
+  let streamClosed = false
+  let finished = false
+
+  // 先挂事件流、等它真正打开再投递 prompt。
+  // 之前是先 prompt 再订阅：模型半秒就跑完的回合会整个漏掉（turn/end 丢失 → 一直干等到超时）。
+  const ac = new AbortController()
+  const buffered = []
+  let waiter = null
+  const wake = () => { if (waiter) { const w = waiter; waiter = null; w() } }
+  let markOpen = () => {}
+  const opened = new Promise((resolve) => { markOpen = resolve })
+  const pump = (async () => {
+    try {
+      for await (const envelope of api.events.mux({}, ac.signal, () => markOpen())) buffered.push(envelope)
+    } catch { /* 流断了就按已收到的事件判定 */ }
+    streamClosed = true
+    wake()
+  })()
+  // 最多等 5 秒；DSH 不接受订阅时也别把整轮卡死。
+  await Promise.race([opened, new Promise((resolve) => setTimeout(resolve, 5000))])
+
   const accepted = await api.sessions.prompt({
     sessionId,
     mode: 'queue',
@@ -284,42 +380,67 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
     throw new Error(`DSH 拒绝了这次投递：${accepted?.result?.error?.code ?? '未知'} ${accepted?.result?.error?.message ?? ''}`)
   }
 
-  // 等这一轮跑完，把 agent 的总结收回来（只是给面板看，不阻塞修复本身）
-  const collector = createTurnCollector()
-  const deadline = Date.now() + waitMs
-  let reply = ''
-  try {
-    for await (const envelope of api.events.mux({})) {
+  const handleEvent = (event) => {
+    // 收集本轮的 token 用量（与桥接账本同口径：assistant/message|attempt 的 usage）
+    try {
+      const raw = usageOfEvent(event)
+      const turn = Number(event?.data?.turn)
+      const step = Number(event?.data?.step)
+      if (raw && Number.isFinite(turn) && Number.isFinite(step)) {
+        const retry = Number(event?.data?.retry) || 0
+        const buckets = normalizeUsage(raw)
+        usageSamples.set(`${turn}|${step}|${retry}`, {
+          t: Number.isFinite(Number(event.time)) ? Number(event.time) : Date.now(),
+          provider: event?.data?.provider ?? event?.data?.usage?.provider ?? '',
+          model: event?.data?.usage?.model ?? event?.data?.model ?? '',
+          buckets
+        })
+      }
+      if (event?.type === 'tool/call') {
+        // 记下参数：命令类工具要靠命令文本判断「这条 pwsh 到底是在读还是在写」。
+        const rawArgs = event?.data?.args ?? event?.data?.input ?? event?.data?.arguments
+        let argText = ''
+        try { argText = typeof rawArgs === 'string' ? rawArgs : (rawArgs ? JSON.stringify(rawArgs) : '') } catch {}
+        const item = { name: String(event?.data?.name || ''), ok: null, args: argText.slice(0, 4000) }
+        toolCalls.push(item)
+        const callId = String(event?.data?.callId || event?.data?.id || '')
+        if (callId) callsById.set(callId, item)
+      } else if (event?.type === 'tool/result') {
+        const callId = String(event?.data?.callId || event?.data?.id || '')
+        const item = callsById.get(callId) || toolCalls[toolCalls.length - 1]
+        if (item && item.ok === null) item.ok = event?.data?.isError !== true
+      }
+      if (event?.type === 'turn/error' || event?.type === 'error') {
+        turnError = String(event?.data?.message || event?.data?.code || 'error').slice(0, 120)
+      }
+    } catch { /* 记账采集失败不影响主链路 */ }
+    const done = collector.push(event)
+    if (done) {
+      reply = typeof done === 'string' ? done : (done?.text ?? '')
+      turnReason = typeof done === 'string' ? null : (done?.reason ?? null)
+      finished = true
+    }
+  }
+
+  while (!finished) {
+    while (buffered.length && !finished) {
+      const envelope = buffered.shift()
       const frame = envelope?.payload
       if (!frame || frame.type !== 'session/event') continue
       if (String(frame.sessionId) !== sessionId) continue
-      const event = frame.event
-      // 收集本轮的 token 用量（与桥接账本同口径：assistant/message|attempt 的 usage）
-      try {
-        const raw = usageOfEvent(event)
-        const turn = Number(event?.data?.turn)
-        const step = Number(event?.data?.step)
-        if (raw && Number.isFinite(turn) && Number.isFinite(step)) {
-          const retry = Number(event?.data?.retry) || 0
-          const buckets = normalizeUsage(raw)
-          usageSamples.set(`${turn}|${step}|${retry}`, {
-            t: Number.isFinite(Number(event.time)) ? Number(event.time) : Date.now(),
-            provider: event?.data?.provider ?? event?.data?.usage?.provider ?? '',
-            model: event?.data?.usage?.model ?? event?.data?.model ?? '',
-            buckets
-          })
-        }
-        if (event?.type === 'turn/error' || event?.type === 'error') {
-          turnError = String(event?.data?.message || event?.data?.code || 'error').slice(0, 120)
-        }
-      } catch { /* 记账采集失败不影响主链路 */ }
-      const done = collector.push(event)
-      if (done) { reply = typeof done === 'string' ? done : (done?.text ?? ''); break }
-      if (Date.now() > deadline) break
+      handleEvent(frame.event)
     }
-  } catch {
-    // 事件流断了无所谓：prompt 已经被 DSH 接受，agent 照样会干活。
+    if (finished) break
+    if (streamClosed) { streamLost = true; break }
+    if (Date.now() > deadline) { timedOut = true; break }
+    await Promise.race([
+      new Promise((resolve) => { waiter = resolve }),
+      new Promise((resolve) => setTimeout(resolve, 1000))
+    ])
   }
+  // 收尾：关掉订阅，否则 WS 会把这个一次性脚本挂住不退出。
+  ac.abort()
+  await pump.catch(() => {})
 
   // 把本轮每一次模型请求记进本地用量账本（来源：修复）。
   try {
@@ -344,10 +465,40 @@ export async function handoffToAgent(findings, { waitMs = 120000, note = '', aut
     }
   } catch { /* 记账失败不影响交接结果 */ }
 
+  // ── 判定这一轮到底算不算「修了」 ───────────────────────────────────────────
+  // 之前只要 DSH 接了 prompt 就记 handed-off，agent 交了空回复也照样显示成功。
+  // 现在以「真的产生了落盘改动」为准（工作区快照 + 明确的写盘工具 + 带写操作的命令）：
+  // 只读的 read/grep/glob/web_fetch，以及只读的 pwsh（Get-FileHash 之类）都不算。
+  const afterSnapshot = snapshotWorkspace(WORKSPACE_DIR)
+  const workspaceDiff = diffSnapshots(beforeSnapshot, afterSnapshot)
+  const directWrites = toolCalls.filter((c) => c.ok === true && DIRECT_MUTATING_TOOLS.has(BARE_TOOL_NAME(c.name)))
+  const shellWrites = toolCalls.filter((c) => c.ok === true && SHELL_TOOLS.has(BARE_TOOL_NAME(c.name)) && SHELL_WRITE_RE.test(c.args || ''))
+  const changed = workspaceDiff.total > 0 || directWrites.length > 0 || shellWrites.length > 0
+  const reasonKind = String(turnReason?.kind || '')
+  const aborted = /abort|cancel/i.test(reasonKind) || /abort|cancel/i.test(String(turnReason?.reason?.kind || ''))
+  let incompleteReason = ''
+  if (turnError) incompleteReason = `turn-error: ${turnError}`
+  else if (streamLost) incompleteReason = 'event-stream-lost: 事件流提前断开，无法确认回合结果'
+  else if (timedOut) incompleteReason = `timeout: 超过 ${Math.round(waitMs / 1000)}s 未结束`
+  else if (aborted) incompleteReason = `aborted: ${reasonKind || 'user'}`
+  else if (!changed) incompleteReason = 'no-change: 工作区没有任何落盘改动（只读/查询或命令未真正写入）'
+  const completed = !incompleteReason
+  const toolsSummary = toolCalls.slice(0, 30).map((c) => `${c.name || '?'}:${c.ok === true ? 'ok' : c.ok === false ? 'err' : '?'}`)
+  // 无论成败都保留原始输出：失败时 reply 常常是空的，工具轨迹就是唯一证据。
+  const raw = String(reply || '').trim() || `（无文字回复）工具轨迹：${toolsSummary.join(' · ') || '无'}`
+
   return {
     sessionId,
     workspaceId,
     reply: String(reply || '').slice(0, 4000),
+    raw: raw.slice(0, 4000),
+    completed,
+    reason: incompleteReason,
+    turnReason: reasonKind,
+    tools: toolsSummary,
+    changed,
+    workspaceDiff,
+    preset: repairPreset,
     baseUrl,
     model: appliedModel,
     provider: choice?.provider || null,
@@ -399,21 +550,44 @@ async function main() {
       note: argOf('--note'),
       auto
     })
+    // 只有「确实动过文件且这一轮正常结束」才记 handed-off；
+    // 空回复/没改动的，记 incomplete 并保留原始输出，面板会显示「未完成·无改动」。
     writeHandoff(code, {
-      status: 'handed-off',
+      status: r.completed ? 'handed-off' : 'incomplete',
+      reason: r.reason || '',
+      raw: r.raw || '',
+      tools: r.tools || [],
+      changed: Boolean(r.changed),
+      workspaceDiff: r.workspaceDiff || null,
       sessionId: r.sessionId,
       reply: r.reply,
       model: r.model,
       provider: r.provider,
+      preset: r.preset,
       trigger: auto ? 'auto' : 'manual',
       route: 'model',
       fed: auto,
       finishedAt: Date.now()
     })
-    console.log(JSON.stringify({ ok: true, code, sessionId: r.sessionId, reply: r.reply, model: r.model, auto }))
+    console.log(JSON.stringify({
+      ok: r.completed,
+      code,
+      status: r.completed ? 'handed-off' : 'incomplete',
+      reason: r.reason,
+      sessionId: r.sessionId,
+      reply: r.reply,
+      raw: r.raw,
+      tools: r.tools,
+      changed: r.changed,
+      workspaceDiff: r.workspaceDiff,
+      model: r.model,
+      auto
+    }))
   } catch (e) {
     writeHandoff(code, { status: 'failed', error: e?.message || String(e), trigger: auto ? 'auto' : 'manual', finishedAt: Date.now() })
     console.log(JSON.stringify({ ok: false, code, error: e?.message || String(e) }))
+    // 出错时事件流可能还没关，留一点时间把 stdout 刷出去再强退，避免进程挂住。
+    setTimeout(() => process.exit(1), 150)
   }
 }
 

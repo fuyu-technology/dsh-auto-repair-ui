@@ -229,7 +229,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 
 | 变量 | 含义 | 默认 |
 |---|---|---|
-| `REPAIR_DIR` | 自愈系统根目录 | `<你的 auto-repair 目录>` |
+| `REPAIR_DIR` | 自愈系统根目录 | `D:\大肥鱼\auto-repair` |
 | `AUTO_REPAIR_INTERVAL_MS` | 巡检间隔（毫秒） | `30000` |
 
 策略文件 `state/repair-policy.json` 字段：

@@ -77,7 +77,7 @@ const argOf = (name, fallback = '') => {
 const JSON_ONLY = ARGS.some((a) =>
   ['--check', '--repair', '--repair-all', '--agent', '--get-policy', '--set-policy',
     '--models', '--get-model', '--set-model', '--scan-clients', '--set-client',
-    '--providers', '--set-provider', '--probe-provider', '--custom-provider', '--notify-test'].includes(a)
+    '--providers', '--set-provider', '--probe-provider', '--custom-provider', '--notify-test', '--chat'].includes(a)
 )
 const QUIET_STDOUT = JSON_ONLY
 
@@ -602,6 +602,21 @@ if (ARGS.includes('--set-model')) {
   }
   const current = writeChoice({ provider, model })
   console.log(JSON.stringify({ ok: true, current }))
+  process.exit(0)
+}
+
+// 队列的 DSH 通道：用 DSH 会话执行一次普通模型任务（不直连供应商 HTTP）。
+if (ARGS.includes('--chat')) {
+  const raw = argOf('--chat')
+  let req = {}
+  try { req = JSON.parse(raw || '{}') } catch { req = {} }
+  try {
+    const { runChat } = await import('./dsh-chat.mjs')
+    const out = await runChat(req)
+    console.log(JSON.stringify(out))
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: String(e?.message || e) }))
+  }
   process.exit(0)
 }
 

@@ -11,9 +11,17 @@
 // 保留 90 天；追加时低频清理，清理走锁 + 临时文件原子替换，避免并发写丢行。
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const ROOT = 'D:\\大肥鱼'
-export const USAGE_FILE = path.join(ROOT, 'auto-repair', 'state', 'usage.jsonl')
+// 仓库根目录按本文件位置推导（usage.mjs 在 auto-repair/ 下），
+// 这样别人 clone 到别的盘符也能用；需要指向别处时用 DSH_REPAIR_ROOT 覆盖。
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const ROOT = process.env.DSH_REPAIR_ROOT ? path.resolve(process.env.DSH_REPAIR_ROOT) : path.dirname(HERE)
+// 与其它状态文件一致：测试/迁移时可用 REPAIR_STATE_DIR 指到别的目录，避免污染真实账本。
+const STATE_DIR = process.env.REPAIR_STATE_DIR
+  ? path.resolve(process.env.REPAIR_STATE_DIR)
+  : path.join(ROOT, 'auto-repair', 'state')
+export const USAGE_FILE = path.join(STATE_DIR, 'usage.jsonl')
 const TOKEN_LEDGER_FILE = path.join(ROOT, 'qq-bridge', 'state', 'token-usage.jsonl')
 const LOCK_FILE = path.join(ROOT, 'auto-repair', 'state', 'usage.lock')
 const KEEP_DAYS = 90
@@ -102,6 +110,44 @@ export function appendUsage(entry, { prune = false } = {}) {
   } catch {
     return false
   }
+}
+
+/**
+ * 智谱 chat/completions 返回的 usage → 账本 buckets。
+ * 拿不到用量时返回 null（调用方记 missing:true，UI 显示「缺失」而不是 0）。
+ */
+export function zhipuUsageBuckets(usage) {
+  if (!usage || typeof usage !== 'object') return null
+  const prompt = Number(usage.prompt_tokens)
+  const completion = Number(usage.completion_tokens)
+  const cached = Number(usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens)
+  if (!Number.isFinite(prompt) && !Number.isFinite(completion)) return null
+  const p = Number.isFinite(prompt) ? Math.max(0, Math.round(prompt)) : 0
+  const o = Number.isFinite(completion) ? Math.max(0, Math.round(completion)) : 0
+  const hit = Number.isFinite(cached) ? Math.min(p, Math.max(0, Math.round(cached))) : 0
+  return { cacheMiss: p - hit, cacheHit: hit, cacheWrite: 0, output: o }
+}
+
+/**
+ * 记一笔「队列直连供应商」的调用（来源 queue）。
+ * 队列之前绕过了所有账本，导致这部分 token 在用量页完全看不到。
+ */
+export function recordQueueCall({ t, provider, model, usage, ms, ok, err, test } = {}) {
+  const buckets = zhipuUsageBuckets(usage)
+  return appendUsage({
+    t: Number(t) || Date.now(),
+    src: 'queue',
+    provider: String(provider || ''),
+    model: String(model || ''),
+    ...(buckets ? { b: buckets } : {}),
+    input: buckets ? buckets.cacheMiss + buckets.cacheHit : 0,
+    output: buckets ? buckets.output : 0,
+    ms: Number(ms) || 0,
+    ok: ok !== false,
+    err: err ? String(err).slice(0, 120) : '',
+    missing: !buckets,
+    test: test === true
+  })
 }
 
 /** 按模型名反推厂商（只在账本缺 provider 时兜底用）。 */

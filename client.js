@@ -1170,7 +1170,7 @@ window.__ModuleLoader__.load({
           '默认全关；扫不到就显示「未检测到」，也可以手填 .exe 完整路径。',
           h('br'),
           '手动诊断：',
-          h('code', null, 'node <你的 auto-repair 目录>\\auto-repair.mjs --check')
+          h('code', null, 'node D:\\大肥鱼\\auto-repair\\auto-repair.mjs --check')
         )
       )
     }

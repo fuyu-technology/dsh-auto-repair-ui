@@ -380,6 +380,10 @@ export function keyConfigured(envName) {
 export function readinessOf(providers, provider, model) {
   const pid = normalizeProviderId(provider)
   const mid = String(model || '').trim()
+  // DSH 账号模型由 DSH 自己托管（没有可读取的 API Key），只要 DSH 在线就算就绪。
+  if (pid === 'deepseek-account') {
+    return { ok: true, code: null, reason: 'DSH 账号模型（无需 API Key）', keyEnv: null, keySource: null }
+  }
   const keyEnv = providerKeyEnv(pid)
   const group = (providers || []).find((p) => p.id === pid)
   if (!group) {
