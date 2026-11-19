@@ -22,6 +22,14 @@ state/*
 credentials.json
 .github-token
 
+# 本地插件源码目录（同一份内容已平铺在仓库根目录，这里只留本地副本）
+dsh-auto-repair-ui/
+
+# 本地运维脚本（保留在磁盘，不入库）
+tools/*
+!tools/mcp-registration.mjs
+!tools/net-listeners.mjs
+
 # 临时文件
 *.tmp
 _tmp*
