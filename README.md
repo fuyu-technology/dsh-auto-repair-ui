@@ -205,6 +205,42 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 
 装完重启 DSH，面板出现在：**DSH → 左下角账号菜单 → 设置 → 左侧导航「自愈」**。
 
+## 工作区（首次使用必读）
+
+面板本身只是 UI，真正干活的是伴生守护进程 `auto-repair.mjs`。它需要一个「工作区根目录」——也就是**同时放着 `DeepSeek Harness.exe` 与 `qq-bridge` 目录的那一级**（例如 `D:\大肥鱼`）。
+
+### 第一次使用：自己指定
+
+第一次打开面板时，最上方会出现「**首次使用：请先选择工作区**」，下面是「工作区」卡片：
+
+- **手输**：直接在输入框填路径，回车或点「保存」；
+- **选目录**：点「选择目录…」弹出系统文件夹对话框，选好后路径会填进输入框——**仍然要点「保存」才生效**，只选不保存不会写盘。
+
+### 选错了会被拦下
+
+保存时会校验目录，必须同时满足：
+
+1. 路径存在，且是目录；
+2. 里面有 **DeepSeek Harness 可执行文件**（`DeepSeek Harness*.exe`，不区分大小写）；
+3. 里面有 **`qq-bridge` 目录**；
+4. 不能直接选 `qq-bridge` 或 `auto-repair` 本身——那样会提示「请选择上一级目录」。
+
+任一条不满足都会**拒绝保存**，并在卡片下方列出缺少的项，同时说明应该指向哪一级（例如「请选择同时包含 DeepSeek Harness.exe 与 qq-bridge 的那一级」）。
+
+### 以后怎么改
+
+随时在同一个「工作区」卡片里改，输入或重新选择后点「保存」即可。生效值有三个来源，优先级从高到低：
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | 环境变量 `AUTO_REPAIR_ROOT` | 最高。一旦设置，**面板里怎么改都不生效**——面板保存的是配置文件，而环境变量始终压过它；此时卡片上会写明「当前由环境变量 AUTO_REPAIR_ROOT 指定」。要改就去改环境变量或取消它 |
+| 2 | 面板保存的配置 | 存在 `state/workspace.json`，面板里修改的就是这一项 |
+| 3 | 仓库自身目录 | 兜底。前两者都没有时使用，保证未配置也能启动（此时通常缺 DSH 或 qq-bridge，面板会提示不可用） |
+
+### 为什么保存后不用重启
+
+面板每次触发诊断 / 修复时，都会把当前工作区以 `AUTO_REPAIR_ROOT` 注入到守护进程**子进程**的环境变量里。因此保存的那一刻起，**下一次诊断就走新目录**——不需要重启 DSH、不需要重启守护进程，也不需要改代码。守护进程自己下次启动时也会读取同一份 `state/workspace.json`。
+
 ## 宿主依赖
 
 面板本身不含修复逻辑，需要另外跑一个伴生守护进程：
@@ -230,6 +266,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | 变量 | 含义 | 默认 |
 |---|---|---|
 | `REPAIR_DIR` | 自愈系统根目录 | `D:\大肥鱼\auto-repair` |
+| `AUTO_REPAIR_ROOT` | 工作区根目录（优先级最高，面板里改不动它） | 无；未设时读 `state/workspace.json`，再退回仓库自身目录 |
 | `AUTO_REPAIR_INTERVAL_MS` | 巡检间隔（毫秒） | `30000` |
 
 策略文件 `state/repair-policy.json` 字段：
@@ -257,6 +294,8 @@ dsh plugin --profile web add link:/path/to/dsh-auto-repair-ui
 | GET / POST / PUT | `/dsh-auto-repair/policy` | 读 / 写审批策略（`mode`、`agentAssist`、`autoFeed`） |
 | GET / POST | `/dsh-auto-repair/models` | 读模型目录 / 切换「让 AI 修」用的模型（body: `provider`、`model`） |
 | GET / POST | `/dsh-auto-repair/clients` | 扫描本机客户端 / 改路径或开关（body: `id`、`path`、`launch`） |
+| GET / POST | `/dsh-auto-repair/workspace` | 读当前工作区 / 保存新的工作区（body: `path`；校验失败返回 400 并给出 `missing`） |
+| POST | `/dsh-auto-repair/workspace/pick` | 弹出系统「选择文件夹」对话框，返回所选路径（**不保存**，仍需再 POST 一次 `workspace`） |
 | GET / POST | `/dsh-auto-repair/providers` | 各提供方的 API 地址 / Key 状态；body: `id` + `baseUrl` / `apiKey` / `clearKey` / `probe` |
 | POST | `/dsh-auto-repair/repair-one` | 修指定的单条（body: `code`） |
 | POST | `/dsh-auto-repair/repair-all` | 修补所有可修项 |
