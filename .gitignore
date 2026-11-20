@@ -29,6 +29,7 @@ dsh-auto-repair-ui/
 tools/*
 !tools/mcp-registration.mjs
 !tools/net-listeners.mjs
+!tools/workspace.mjs
 
 # 临时文件
 *.tmp

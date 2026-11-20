@@ -216,6 +216,12 @@ window.__ModuleLoader__.load({
   flex: 1 1 320px; min-width: 200px; max-width: 100%;
 }
 .ar-input:disabled { opacity: .5; }
+/* 工作区：输入框 + 选择/保存 */
+.ar-ws-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.ar-ws-row .ar-input { flex: 1 1 340px; }
+.ar-ws-err { color: var(--ar-fatal); font-size: 12px; margin-top: 6px; word-break: break-all; }
+.ar-ws-ok { color: var(--ar-ok); font-size: 12px; margin-top: 6px; word-break: break-all; }
+.ar-ws-note { color: var(--dsw-alias-label-secondary, #8a8a8a); font-size: 12px; margin-top: 6px; word-break: break-all; }
 .ar-client-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .ar-client-row {
   padding: 9px 10px; border-radius: 8px;
@@ -337,6 +343,12 @@ window.__ModuleLoader__.load({
       const [keyDraft, setKeyDraft] = useState({})
       // 智谱模型预设的临时选择（providerId → modelId），点「选为『让 AI 修』模型」才落盘
       const [presetPick, setPresetPick] = useState({})
+      // 工作区：首次使用选择 / 后续修改
+      const [ws, setWs] = useState(null)
+      const [wsDraft, setWsDraft] = useState('')
+      const [wsBusy, setWsBusy] = useState(false)
+      const [wsError, setWsError] = useState('')
+      const [wsMissing, setWsMissing] = useState([])
       const timerRef = useRef(null)
 
       const load = useCallback(async (silent) => {
@@ -369,6 +381,19 @@ window.__ModuleLoader__.load({
       }, [])
 
       useEffect(() => { loadModels() }, [loadModels])
+
+      /** 读工作区设置（首次使用 / 当前生效值） */
+      const loadWorkspace = useCallback(async () => {
+        try {
+          const r = await fetchJson('/workspace', { cache: 'no-store' })
+          setWs(r)
+          setWsDraft((prev) => prev || r?.root || r?.envRoot || '')
+        } catch (e) {
+          setWs({ ok: false, error: e?.message || String(e) })
+        }
+      }, [])
+
+      useEffect(() => { loadWorkspace() }, [loadWorkspace])
 
       /** 扫本机装了哪些模型客户端（扫不到就如实是「未检测到」） */
       const loadClients = useCallback(async (silent) => {
@@ -642,6 +667,57 @@ window.__ModuleLoader__.load({
         }
       }, [postJson, load])
 
+      /** 选目录（系统对话框，选完只填进输入框，不直接保存） */
+      const pickWorkspace = useCallback(async () => {
+        setWsBusy(true)
+        setWsError('')
+        setWsMissing([])
+        try {
+          const r = await postJson('/workspace/pick', {})
+          if (r?.ok && r.path) {
+            setWsDraft(r.path)
+            const v = r.validation || {}
+            if (v.ok === false) {
+              setWsError(String(v.message || '这个目录不可用'))
+              setWsMissing(Array.isArray(v.missing) ? v.missing : [])
+            }
+          } else if (r && r.error) {
+            setWsError(String(r.error))
+          }
+        } catch (e) {
+          setWsError(e?.message || String(e))
+        } finally {
+          setWsBusy(false)
+        }
+      }, [postJson])
+
+      /** 保存工作区：校验不过就停在面板上，不落盘 */
+      const saveWorkspace = useCallback(async () => {
+        setWsBusy(true)
+        setWsError('')
+        setWsMissing([])
+        try {
+          const res = await fetch(API + '/workspace', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: wsDraft })
+          })
+          const r = await res.json().catch(() => null)
+          if (res.ok && r?.ok) {
+            setWs(r)
+            setToast({ ok: true, text: `工作区已保存：${r.root}（下一次诊断立即生效）` })
+            await load(true)
+          } else {
+            setWsError(String(r?.message || r?.error || `保存失败（HTTP ${res.status}）`))
+            setWsMissing(Array.isArray(r?.missing) ? r.missing : [])
+          }
+        } catch (e) {
+          setWsError(e?.message || String(e))
+        } finally {
+          setWsBusy(false)
+        }
+      }, [wsDraft, load])
+
       if (loading) {
         return h('div', { className: 'ar-root' },
           h('div', { className: 'ar-empty' }, '正在读取自愈状态…')
@@ -730,6 +806,63 @@ window.__ModuleLoader__.load({
               onClick: doRepair
             }, busy ? '巡检中…' : '巡检一轮')
           )
+        ),
+
+        // 首次使用：还没配置过工作区时，先把这一步摆在最上面
+        ws && ws.needsSetup
+          ? h('div', { className: 'ar-finding warn' },
+            h('div', { className: 'ar-finding-title' }, '首次使用：请先选择工作区'),
+            h('div', { className: 'ar-finding-detail' },
+              '选择同时包含 DeepSeek Harness.exe 与 qq-bridge 目录的那一级（例如 D:\\大肥鱼）。选错会在这里被拦下，并说明缺少什么。')
+          )
+          : null,
+
+        // ── 工作区：首次使用 / 随时修改 ──────────────────────────────────
+        h('div', { className: 'ar-policy' },
+          h('div', { className: 'ar-policy-head' },
+            h('span', { className: 'ar-policy-title' }, '工作区'),
+            h('span', { className: 'ar-policy-hint' },
+              ws?.source === 'env'
+                ? '当前由环境变量 AUTO_REPAIR_ROOT 指定（面板里修改不会覆盖它）'
+                : ws?.root
+                  ? `当前生效：${ws.root}`
+                  : '尚未配置，请选择工作区目录'
+            )
+          ),
+          h('div', { className: 'ar-ws-row' },
+            h('input', {
+              className: 'ar-input',
+              value: wsDraft,
+              placeholder: '例如 D:\\大肥鱼',
+              disabled: wsBusy,
+              onChange: (e) => {
+                setWsDraft(e.target.value)
+                setWsError('')
+                setWsMissing([])
+              },
+              onKeyDown: (e) => { if (e.key === 'Enter' && !wsBusy) saveWorkspace() }
+            }),
+            h('button', {
+              className: 'ar-btn',
+              disabled: wsBusy,
+              onClick: pickWorkspace
+            }, '选择目录…'),
+            h('button', {
+              className: 'ar-btn primary',
+              disabled: wsBusy || !String(wsDraft || '').trim(),
+              onClick: saveWorkspace
+            }, wsBusy ? '处理中…' : '保存')
+          ),
+          wsError
+            ? h('div', { className: 'ar-ws-err' },
+              `${wsError}${wsMissing.length ? `（缺少：${wsMissing.join('、')}）` : ''}`)
+            : ws?.validation && ws.validation.ok === false
+              ? h('div', { className: 'ar-ws-err' }, `当前配置不可用：${ws.validation.message}`)
+              : ws?.root
+                ? h('div', { className: 'ar-ws-ok' }, `已就绪：${ws.root}`)
+                : null,
+          h('div', { className: 'ar-ws-note' },
+            '规则：目录必须存在，且包含 DeepSeek Harness.exe 和 qq-bridge 目录；不能直接选 qq-bridge 或 auto-repair 本身。保存后下一次诊断立即生效，无需改代码。')
         ),
 
         // 概览卡片

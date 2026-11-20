@@ -15,13 +15,10 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { resolveWorkspaceRoot } from './workspace.mjs'
 
-// 仓库根：优先环境变量 AUTO_REPAIR_ROOT，否则取本文件上两级（tools/ 的上一级是仓库根）。
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-export const ROOT = process.env.AUTO_REPAIR_ROOT
-  ? path.resolve(process.env.AUTO_REPAIR_ROOT)
-  : path.resolve(HERE, '..')
+// 工作区根目录：与 diagnose.mjs 同一套解析（环境变量 → 面板保存 → 仓库自身）
+export const ROOT = resolveWorkspaceRoot()
 
 /**
  * 找一个真实存在的 node，用于写进 MCP 注册的 command。

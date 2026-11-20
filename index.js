@@ -57,6 +57,8 @@ const NOTIFY_PATH = `${API_BASE}/notify-policy`
 const REPEAT_ALERT_PATH = `${API_BASE}/repeat-alert`
 const SEND_RATE_PATH = `${API_BASE}/send-rate`
 const CONTEXT_SAVING_PATH = `${API_BASE}/context-saving`
+const WORKSPACE_PATH = `${API_BASE}/workspace`
+const WORKSPACE_PICK_PATH = `${API_BASE}/workspace/pick`
 
 // 智谱开放平台（bigmodel.cn）OpenAI 兼容接口的官方地址（docs.bigmodel.cn）。
 const ZHIPU_DEFAULT_BASE = 'https://open.bigmodel.cn/api/paas/v4'
@@ -76,10 +78,14 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 //   - 装到 ~/.dsh/plugins 下时两者不在同一棵树，退回原来的绝对路径；
 //   - 两种情况都可用 REPAIR_DIR 覆盖，方便搬到别的盘符/机器。
 const REPAIR_DIR = process.env.REPAIR_DIR || (() => {
-  const local = path.resolve(HERE, '..')
-  try {
-    if (fs.existsSync(path.join(local, 'auto-repair.mjs'))) return local
-  } catch {}
+  // 两种布局都认：
+  //   1) 插件与守护进程同一个仓库（index.js 与 auto-repair.mjs 同级）→ HERE
+  //   2) 装到 ~/.dsh/plugins 下、守护进程在 auto-repair/ 子目录 → HERE/..
+  for (const c of [HERE, path.resolve(HERE, '..')]) {
+    try {
+      if (fs.existsSync(path.join(c, 'auto-repair.mjs'))) return c
+    } catch {}
+  }
   return 'D:\\大肥鱼\\auto-repair'
 })()
 const REPAIR_STATE = path.join(REPAIR_DIR, 'state')
@@ -107,6 +113,130 @@ function readJson(file, fallback) {
   } catch {
     return fallback
   }
+}
+
+// ── 工作区（首次使用 / 重新选择）────────────────────────────────────────────
+// 存储：state/workspace.json
+// 优先级：环境变量 AUTO_REPAIR_ROOT > 已保存配置 > 未配置（需要用户选）
+const WORKSPACE_FILE = path.join(REPAIR_STATE, 'workspace.json')
+const DSH_EXE_RE = /^deepseek harness.*\.exe$/i
+
+function hasDshExe(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .some((e) => e.isFile() && DSH_EXE_RE.test(e.name))
+  } catch {
+    return false
+  }
+}
+
+/** 校验一个目录是否是可用的工作区根目录（不含 DSH 与 qq-bridge 的都拒绝） */
+function validateWorkspace(input) {
+  const raw = String(input || '').trim()
+  if (!raw) {
+    return { ok: false, path: '', missing: ['路径'], message: '请填写或选择工作区目录' }
+  }
+  const p = path.resolve(raw)
+  let st = null
+  try { st = fs.statSync(p) } catch {}
+  if (!st) {
+    return { ok: false, path: p, missing: ['目录不存在'], message: `目录不存在：${p}` }
+  }
+  if (!st.isDirectory()) {
+    return { ok: false, path: p, missing: ['不是目录'], message: `这不是一个目录：${p}` }
+  }
+  const base = path.basename(p).toLowerCase()
+  if (base === 'qq-bridge' || base === 'auto-repair') {
+    return {
+      ok: false,
+      path: p,
+      missing: ['层级不对'],
+      message: `请选择上一级目录（${path.dirname(p)}），而不是 ${path.basename(p)} 本身`
+    }
+  }
+  const missing = []
+  if (!hasDshExe(p)) missing.push('DeepSeek Harness.exe')
+  try {
+    if (!fs.statSync(path.join(p, 'qq-bridge')).isDirectory()) missing.push('qq-bridge 目录')
+  } catch {
+    missing.push('qq-bridge 目录')
+  }
+  if (missing.length) {
+    return {
+      ok: false,
+      path: p,
+      missing,
+      message: `这个目录缺少 ${missing.join(' 和 ')}。请选择同时包含 DeepSeek Harness.exe 与 qq-bridge 的那一级（例如 D:\\大肥鱼）。`
+    }
+  }
+  return { ok: true, path: p, missing: [], message: '' }
+}
+
+function readWorkspaceConfig() {
+  const doc = readJson(WORKSPACE_FILE, null)
+  const v = typeof doc?.workspace === 'string' ? doc.workspace.trim() : ''
+  return v ? path.resolve(v) : ''
+}
+
+/** 当前工作区快照：给面板显示用 */
+function workspaceSnapshot() {
+  const envRoot = String(process.env.AUTO_REPAIR_ROOT || '').trim()
+  const saved = readWorkspaceConfig()
+  const active = envRoot ? path.resolve(envRoot) : saved
+  return {
+    ok: true,
+    // 真正生效的目录；未配置且无环境变量时为 null
+    root: active || null,
+    source: envRoot ? 'env' : saved ? 'config' : 'unset',
+    envRoot: envRoot ? path.resolve(envRoot) : '',
+    saved,
+    configFile: WORKSPACE_FILE,
+    // 首次使用：既没有环境变量、也没有保存过
+    needsSetup: !envRoot && !saved,
+    validation: active ? validateWorkspace(active) : null
+  }
+}
+
+function saveWorkspaceConfig(dir) {
+  fs.mkdirSync(REPAIR_STATE, { recursive: true })
+  const tmp = `${WORKSPACE_FILE}.tmp`
+  const doc = { version: 1, workspace: path.resolve(dir), updatedAt: Date.now() }
+  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8')
+  fs.renameSync(tmp, WORKSPACE_FILE)
+  return doc
+}
+
+/** 传给守护进程子进程的工作区（校验不过就不传，让它走自己的兜底） */
+function currentWorkspaceRoot() {
+  const snap = workspaceSnapshot()
+  if (!snap.root) return ''
+  return snap.validation && snap.validation.ok ? snap.root : ''
+}
+
+/** 调系统「选择文件夹」对话框（Windows，返回绝对路径） */
+function pickFolderViaShell() {
+  return new Promise((resolve) => {
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms;',
+      '$d = New-Object System.Windows.Forms.FolderBrowserDialog;',
+      "$d.Description = '选择工作区根目录（包含 DeepSeek Harness.exe 与 qq-bridge 的那一级）';",
+      "$d.ShowNewFolderButton = $false;",
+      'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }'
+    ].join(' ')
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-STA', '-Command', script],
+      { timeout: 180000, windowsHide: true, encoding: 'utf8' },
+      (err, stdout) => {
+        const picked = String(stdout || '').trim()
+        if (err || !picked) {
+          resolve({ ok: false, error: picked ? '' : '没有选择目录' })
+          return
+        }
+        resolve({ ok: true, path: picked })
+      }
+    )
+  })
 }
 
 /** 读 POST 请求体（JSON） */
@@ -138,7 +268,17 @@ function runCli(args, timeoutMs = 90000) {
       execFile(
         findNode(),
         [REPAIR_ENTRY, ...args],
-        { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8' },
+        {
+          timeout: timeoutMs,
+          windowsHide: true,
+          maxBuffer: 8 * 1024 * 1024,
+          encoding: 'utf8',
+          // 每次调 CLI 都按「当前工作区」注入，面板里改完立即生效（下一次诊断就走新目录）
+          env: (() => {
+            const ws = currentWorkspaceRoot()
+            return ws ? { ...process.env, AUTO_REPAIR_ROOT: ws } : process.env
+          })()
+        },
         (err, stdout, stderr) => {
           const out = String(stdout || '')
           const errOut = String(stderr || '')
@@ -1237,6 +1377,55 @@ function apply(ctx) {
         return
       }
       sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
+  // ── 工作区：首次使用选择 / 后续修改（保存后下一次诊断立即生效） ──────────────
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: WORKSPACE_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method === 'GET') {
+        sendJson(res, 200, workspaceSnapshot())
+        return
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readBody(req)
+        const v = validateWorkspace(body.path)
+        if (!v.ok) {
+          sendJson(res, 400, { ok: false, ...v })
+          return
+        }
+        try {
+          saveWorkspaceConfig(v.path)
+        } catch (e) {
+          sendJson(res, 500, { ok: false, path: v.path, missing: [], message: `写入配置失败：${e.message}` })
+          return
+        }
+        sendJson(res, 200, workspaceSnapshot())
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '方法不允许' })
+    }
+  }))
+
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: WORKSPACE_PICK_PATH,
+    handler: async (req, res) => {
+      const method = String(req.method || 'GET').toUpperCase()
+      if (method !== 'POST' && method !== 'PUT') {
+        sendJson(res, 405, { ok: false, error: '方法不允许' })
+        return
+      }
+      const r = await pickFolderViaShell()
+      if (!r.ok) {
+        sendJson(res, 200, r)
+        return
+      }
+      // 选完先校验但**不保存**：面板把路径填进输入框，用户点「保存」才落盘
+      sendJson(res, 200, { ok: true, path: r.path, validation: validateWorkspace(r.path) })
     }
   }))
 
@@ -2970,4 +3159,4 @@ function apply(ctx) {
 const inject = ['webServer']
 const name = NS
 
-export { apply, inject, name }
+export { apply, inject, name, validateWorkspace, workspaceSnapshot, saveWorkspaceConfig }
