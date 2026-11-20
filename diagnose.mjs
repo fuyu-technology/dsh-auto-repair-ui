@@ -11,11 +11,18 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { execSync, execFileSync } from 'node:child_process'
 import { MCP_CLIENT_IDS } from './tools/mcp-registration.mjs'
 import { listeningPortsSync, dshPids, processTable } from './tools/net-listeners.mjs'
 
-export const ROOT = 'D:\\大肥鱼'
+// 仓库根：优先环境变量 AUTO_REPAIR_ROOT；否则按本文件自身位置推导，
+// 结果就是本仓库所在目录（换机器 / 换用户名 / 换目录都不用改代码）。
+// 若仓库被作为子目录部署（与 qq-bridge 同级），用 AUTO_REPAIR_ROOT 指定那一级。
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+export const ROOT = process.env.AUTO_REPAIR_ROOT
+  ? path.resolve(process.env.AUTO_REPAIR_ROOT)
+  : HERE
 export const DSH_HOME = path.join(process.env.USERPROFILE || '', '.dsh')
 export const DSH_EXE = path.join(ROOT, 'DeepSeek Harness.exe')
 export const APP_LOG_DIR = path.join(

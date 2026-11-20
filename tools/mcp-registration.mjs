@@ -15,9 +15,34 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-export const NODE_BIN = 'C:\\Users\\Administrator\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe'
-export const SRC_DIR = 'D:\\大肥鱼\\qq-bridge\\src'
+// 仓库根：优先环境变量 AUTO_REPAIR_ROOT，否则取本文件上两级（tools/ 的上一级是仓库根）。
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+export const ROOT = process.env.AUTO_REPAIR_ROOT
+  ? path.resolve(process.env.AUTO_REPAIR_ROOT)
+  : path.resolve(HERE, '..')
+
+/**
+ * 找一个真实存在的 node，用于写进 MCP 注册的 command。
+ * 顺序：AUTO_REPAIR_NODE → DSH 自带运行时 → 仓库内 SnowLuma → 当前进程。
+ * 换机器 / 换用户名时不会指向别人的绝对路径。
+ */
+function resolveNodeBin() {
+  const candidates = [
+    process.env.AUTO_REPAIR_NODE,
+    path.join(process.env.USERPROFILE || '', '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'node', 'bin', 'node.exe'),
+    path.join(ROOT, 'SnowLuma', 'node.exe')
+  ]
+  for (const c of candidates) {
+    if (!c) continue
+    try { if (fs.existsSync(c)) return c } catch {}
+  }
+  return process.execPath
+}
+
+export const NODE_BIN = resolveNodeBin()
+export const SRC_DIR = path.join(ROOT, 'qq-bridge', 'src')
 
 /** 由桥接托管的三个 MCP client（与 scripts/setup-dsh.mjs 的 MANAGED_MCP_IDS 一致） */
 export const MCP_CLIENTS = [
